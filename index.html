@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="sv">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>querybench</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='14' font-size='14'%3E%F0%9F%97%84%EF%B8%8F%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <div id="app">
+      <aside id="sidebar">
+        <div class="sidebar-header">
+          <span class="app-title">querybench</span>
+          <button id="manage-btn" type="button" title="Hantera databaser & servrar">⚙</button>
+        </div>
+        <div class="sidebar-section db-section">
+          <input id="db-filter" type="search" placeholder="Sök databas…" autocomplete="off" spellcheck="false" />
+          <ul id="db-list"></ul>
+        </div>
+        <div class="sidebar-section table-section">
+          <input id="table-filter" type="search" placeholder="Sök tabell…" autocomplete="off" spellcheck="false" />
+          <ul id="table-list"></ul>
+        </div>
+      </aside>
+      <div class="col-resizer" id="resize-sidebar" title="Dra för att ändra bredd"></div>
+      <main id="main">
+        <div class="topbar">
+          <span id="breadcrumb" class="breadcrumb"></span>
+          <button id="run-btn" type="button">▸ Run query</button>
+        </div>
+        <div id="editor"></div>
+        <div class="row-resizer" id="resize-editor" title="Dra för att ändra höjd"></div>
+        <div class="results-status" id="status"></div>
+        <div id="results"></div>
+      </main>
+      <div class="col-resizer" id="resize-drawer" title="Dra för att ändra bredd"></div>
+      <aside id="cell-drawer" class="hidden">
+        <div class="drawer-head">
+          <span class="drawer-title"></span>
+          <div class="drawer-actions">
+            <button id="drawer-copy" type="button" title="Kopiera">Copy</button>
+            <button id="drawer-close" type="button" title="Stäng (Esc)">✕</button>
+          </div>
+        </div>
+        <div class="drawer-body">
+          <div id="drawer-json"></div>
+          <pre id="drawer-text"></pre>
+        </div>
+      </aside>
+    </div>
+
+    <!-- Config / management window -->
+    <div id="config-modal" class="hidden">
+      <div class="config-card">
+        <div class="config-head">
+          <h3 id="config-title">Databaser &amp; servrar</h3>
+          <button id="config-close" type="button" title="Stäng (Esc)">✕</button>
+        </div>
+
+        <!-- List / manage view -->
+        <div id="config-list" class="config-view">
+          <p id="config-empty" class="dialog-subtitle" style="display: none;">
+            Inga anslutningar än. Lägg till en databas — eller en server för att få med flera på en gång.
+          </p>
+          <div class="config-section-head">
+            <span>Databaser</span>
+            <button id="add-db-btn" type="button" class="ghost">+ Databas</button>
+          </div>
+          <ul id="db-manage-list" class="manage-list"></ul>
+          <div class="config-section-head">
+            <span>Servrar</span>
+            <button id="add-server-btn" type="button" class="ghost">+ Server</button>
+          </div>
+          <ul id="server-manage-list" class="manage-list"></ul>
+        </div>
+
+        <!-- Add server view -->
+        <div id="server-view" class="config-view hidden">
+          <button class="link-back" type="button" data-back>← Tillbaka</button>
+          <h4>Lägg till server</h4>
+          <label for="sf-name">Namn</label>
+          <input id="sf-name" type="text" placeholder="t.ex. Local dev" spellcheck="false" autocomplete="off" />
+          <label for="sf-cs">Connection string</label>
+          <textarea id="sf-cs" rows="3" spellcheck="false"
+            placeholder="Server=localhost,1433;User Id=sa;Password=…;TrustServerCertificate=True;Encrypt=False"></textarea>
+          <div class="inline-actions">
+            <button id="sf-fetch" type="button">Hämta databaser</button>
+            <span id="sf-fetch-status" class="muted-note"></span>
+          </div>
+          <div id="sf-pick" class="db-pick hidden">
+            <label class="pick-all"><input type="checkbox" id="sf-all" checked /> <strong>Alla</strong></label>
+            <div id="sf-checks" class="pick-list"></div>
+          </div>
+          <div class="dialog-error" id="sf-error"></div>
+          <div class="dialog-actions">
+            <button type="button" data-back>Avbryt</button>
+            <button id="sf-save" type="button" class="primary" disabled>Spara</button>
+          </div>
+        </div>
+
+        <!-- Add database view -->
+        <div id="db-view" class="config-view hidden">
+          <button class="link-back" type="button" data-back>← Tillbaka</button>
+          <h4>Lägg till databas</h4>
+          <label for="df-name">Namn</label>
+          <input id="df-name" type="text" placeholder="t.ex. app-prod" spellcheck="false" autocomplete="off" />
+          <label for="df-cs">Connection string</label>
+          <textarea id="df-cs" rows="3" spellcheck="false"
+            placeholder="Server=…;Database=app;User Id=…;Password=…;Encrypt=True;TrustServerCertificate=True"></textarea>
+          <p class="dialog-hint">Peka på en specifik databas — inkludera <code>Database=…</code> i strängen.</p>
+          <div class="dialog-error" id="df-error"></div>
+          <div class="dialog-actions">
+            <button type="button" data-back>Avbryt</button>
+            <button id="df-save" type="button" class="primary">Spara &amp; anslut</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
