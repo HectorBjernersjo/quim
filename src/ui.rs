@@ -237,11 +237,15 @@ fn draw_db_list(f: &mut Frame, app: &mut App, area: Rect) {
         let entry = &app.dbs[filtered[pos]];
         let is_sel = pos == app.db_list.sel;
         let is_active = app.active.as_ref().map(|a| a.id.as_str()) == Some(entry.id.as_str());
+        // Cursor row is shown by colouring the text (same as the table list); the
+        // ● marker is what tells you which db is actually selected/connected.
         let marker = if is_active { "● " } else { "  " };
-        let name_style = match (is_active, is_sel && focused) {
-            (_, true) => Style::new().fg(theme::TEXT).add_modifier(Modifier::BOLD),
-            (true, _) => Style::new().fg(theme::ACCENT_DIM),
-            _ => Style::new().fg(theme::TEXT),
+        let name_style = if is_sel && focused {
+            Style::new().fg(theme::ACCENT)
+        } else if is_active {
+            Style::new().fg(theme::ACCENT_DIM)
+        } else {
+            Style::new().fg(theme::TEXT)
         };
         let mut line = Line::from(vec![
             Span::styled(marker, Style::new().fg(theme::ACCENT_DIM)),
@@ -685,6 +689,11 @@ fn draw_results(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let vsel = view.vsel_range();
+    let needle = view.search.to_lowercase();
+    let search_hl = Style::new()
+        .fg(theme::SEARCH_FG)
+        .bg(theme::SEARCH_BG)
+        .add_modifier(Modifier::BOLD);
     let mut lines = vec![Line::from(header), Line::from(sep)];
     for r in range {
         let row = &view.rows[r];
@@ -718,7 +727,11 @@ fn draw_results(f: &mut Frame, app: &mut App, area: Rect) {
                     .bg(theme::ACCENT_DIM)
                     .add_modifier(Modifier::BOLD);
             }
-            spans.push(Span::styled(text, style));
+            if needle.is_empty() {
+                spans.push(Span::styled(text, style));
+            } else {
+                spans.extend(highlight_spans(&text, &needle, style, search_hl));
+            }
             spans.push(Span::styled(
                 "  ",
                 if is_sel_row {
@@ -801,6 +814,34 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         ));
         return;
     }
+    // The results search takes over the status bar while its term is typed.
+    if let Some(view) = app
+        .view
+        .as_ref()
+        .filter(|v| v.searching && app.focus == Pane::Results)
+    {
+        let head = format!(" /{}", view.search);
+        // The cursor sits right after the typed term; the live count trails it.
+        let cursor_x = area.x + head.width() as u16;
+        let count = if view.search.is_empty() {
+            String::new()
+        } else if view.search_hits.is_empty() {
+            "   no matches".into()
+        } else {
+            let pos = view.search_index().map(|i| i + 1).unwrap_or(0);
+            format!("   [{pos}/{}]", view.search_hits.len())
+        };
+        let line = Line::from(vec![
+            Span::styled(head, Style::new().fg(theme::TEXT)),
+            Span::styled(count, Style::new().fg(theme::FAINT)),
+        ]);
+        f.render_widget(Paragraph::new(line).style(Style::new().bg(theme::BG)), area);
+        f.set_cursor_position(Position::new(
+            cursor_x.min(area.x + area.width.saturating_sub(1)),
+            area.y,
+        ));
+        return;
+    }
     let (left, left_color, right) = if app.resize_mode {
         (
             " RESIZE".to_string(),
@@ -832,7 +873,10 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
                 Pane::Results if app.view.as_ref().is_some_and(|v| v.vsel.is_some()) => {
                     "y JSON · Y markdown · j/k extend · Esc cancel"
                 }
-                Pane::Results => "Enter detail · V rows · y/Y yank · r rerun · ? help",
+                Pane::Results if app.view.as_ref().is_some_and(|v| !v.search.is_empty()) => {
+                    "/ search · n/p next/prev · Esc clear · Enter detail · y/Y yank"
+                }
+                Pane::Results => "Enter detail · / search · V rows · y/Y yank · r rerun · ? help",
                 Pane::Detail => "j/k scroll · y copy · q close",
                 Pane::Databases => "Enter select · / filter · a/e/d sources · , settings",
                 _ => "Enter select · / filter · ^R run · ? help",
@@ -1342,7 +1386,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("Ctrl+W, then h/j/k/l", "resize pane (saved to config)"),
         ("", ""),
         ("j/k, gg/G, Ctrl+D/U", "navigate lists & results"),
-        ("/", "filter databases/tables"),
+        ("/", "filter databases/tables · search results (n/p next/prev)"),
         (
             ",",
             "settings: vim mode, servers & databases (not in editor)",
@@ -1440,6 +1484,38 @@ fn pad(text: &str, width: usize) -> String {
     } else {
         format!("{text}{}", " ".repeat(width - w))
     }
+}
+
+/// Split `text` into spans, styling case-insensitive occurrences of `needle`
+/// with `hl` and the rest with `base`. `needle` must already be lowercased.
+fn highlight_spans(text: &str, needle: &str, base: Style, hl: Style) -> Vec<Span<'static>> {
+    if needle.is_empty() {
+        return vec![Span::styled(text.to_string(), base)];
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let nlen = needle.chars().count();
+    let mut spans: Vec<Span<'static>> = vec![];
+    let mut buf = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if i + nlen <= chars.len() {
+            let cand: String = chars[i..i + nlen].iter().collect();
+            if cand.to_lowercase() == needle {
+                if !buf.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut buf), base));
+                }
+                spans.push(Span::styled(cand, hl));
+                i += nlen;
+                continue;
+            }
+        }
+        buf.push(chars[i]);
+        i += 1;
+    }
+    if !buf.is_empty() {
+        spans.push(Span::styled(buf, base));
+    }
+    spans
 }
 
 /// Take a display-column window out of a styled line (for horizontal scroll).

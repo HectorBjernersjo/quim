@@ -18,6 +18,10 @@ pub const MUTED: Color = Color::Gray;
 pub const FAINT: Color = Color::DarkGray;
 pub const ERROR: Color = Color::LightRed;
 
+// Free-text search highlight in the results grid.
+pub const SEARCH_BG: Color = Color::Yellow;
+pub const SEARCH_FG: Color = Color::Black;
+
 // SQL syntax
 pub const SQL_KEYWORD: Color = Color::Magenta;
 pub const SQL_STRING: Color = Color::Green;

@@ -71,6 +71,13 @@ pub struct QueryView {
     /// Anchor row of a V (row-visual) selection.
     pub vsel: Option<usize>,
     pub error: Option<String>,
+    /// Free-text search over the cells (highlight only — no filtering).
+    pub search: String,
+    /// True while the user is typing the search term in the status bar.
+    pub searching: bool,
+    /// Cached (row, col) of every matching cell for the current `search`, kept
+    /// in sync via `refresh_search` so the render loop never rescans per frame.
+    pub search_hits: Vec<(usize, usize)>,
 }
 
 impl QueryView {
@@ -78,6 +85,46 @@ impl QueryView {
     pub fn vsel_range(&self) -> Option<(usize, usize)> {
         self.vsel
             .map(|a| (a.min(self.sel_row), a.max(self.sel_row)))
+    }
+
+    /// Recompute the cached match list after `search` changes.
+    pub fn refresh_search(&mut self) {
+        self.search_hits = self.matches();
+    }
+
+    /// Index of the currently selected cell within `search_hits`, if it is a
+    /// match — i.e. which hit number the cursor sits on.
+    pub fn search_index(&self) -> Option<usize> {
+        self.search_hits
+            .iter()
+            .position(|&m| m == (self.sel_row, self.sel_col))
+    }
+
+    /// True when the displayed text of a cell contains the (lowercased) search
+    /// term. `needle` must already be lowercased.
+    pub fn cell_matches(&self, r: usize, c: usize, needle: &str) -> bool {
+        let cell = self.rows.get(r).and_then(|row| row.get(c)).cloned().flatten();
+        crate::ui::display_text(&cell, self.cols[c].category)
+            .to_lowercase()
+            .contains(needle)
+    }
+
+    /// (row, col) of every cell matching the current search term, in row-major
+    /// order. Empty when no search is active.
+    pub fn matches(&self) -> Vec<(usize, usize)> {
+        let needle = self.search.to_lowercase();
+        if needle.is_empty() {
+            return vec![];
+        }
+        let mut out = vec![];
+        for r in 0..self.rows.len() {
+            for c in 0..self.cols.len() {
+                if self.cell_matches(r, c, &needle) {
+                    out.push((r, c));
+                }
+            }
+        }
+        out
     }
 }
 
@@ -556,6 +603,9 @@ impl App {
                 col_off: 0,
                 vsel: None,
                 error: Some(err.clone()),
+                search: String::new(),
+                searching: false,
+                search_hits: vec![],
             });
             return;
         }
@@ -580,6 +630,9 @@ impl App {
             col_off: 0,
             vsel: None,
             error: None,
+            search: String::new(),
+            searching: false,
+            search_hits: vec![],
         });
     }
 
@@ -762,6 +815,7 @@ impl App {
         let filter_typing = match self.focus {
             Pane::Databases => self.db_list.typing,
             Pane::Tables => self.tbl_list.typing,
+            Pane::Results => self.view.as_ref().is_some_and(|v| v.searching),
             _ => false,
         };
         if key.code == KeyCode::Char(',')
@@ -1607,15 +1661,16 @@ impl App {
         ) {
             return action;
         }
-        if key.code == KeyCode::Enter && !self.db_list.typing {
+        if key.code == KeyCode::Enter {
+            // A single Enter both confirms an active filter and selects the
+            // highlighted db — no need to press it twice.
+            self.db_list.typing = false;
             if let Some(&idx) = self.filtered_dbs().get(self.db_list.sel) {
                 let entry = self.dbs[idx].clone();
                 if self.active.as_ref().map(|a| a.id.as_str()) != Some(entry.id.as_str()) {
                     self.select_db(entry);
                 }
             }
-        } else if key.code == KeyCode::Enter {
-            self.db_list.typing = false;
         }
         Action::None
     }
@@ -1632,7 +1687,10 @@ impl App {
         ) {
             return action;
         }
-        if key.code == KeyCode::Enter && !self.tbl_list.typing {
+        if key.code == KeyCode::Enter {
+            // A single Enter both confirms an active filter and previews the
+            // highlighted table — no need to press it twice.
+            self.tbl_list.typing = false;
             if let Some(&idx) = self.filtered_tables().get(self.tbl_list.sel) {
                 let t = &self.tables[idx];
                 let engine = self
@@ -1645,8 +1703,6 @@ impl App {
                 self.focus = Pane::Results;
                 self.run_query();
             }
-        } else if key.code == KeyCode::Enter {
-            self.tbl_list.typing = false;
         }
         Action::None
     }
@@ -1747,6 +1803,43 @@ impl App {
         Action::None
     }
 
+    /// Move the cursor to the next/previous cell matching the search term.
+    /// `include_current` keeps the cursor put if it already sits on a match
+    /// (used when committing a fresh search with Enter).
+    fn search_jump(&mut self, forward: bool, include_current: bool) {
+        let Some(view) = self.view.as_ref() else {
+            return;
+        };
+        if view.search.is_empty() {
+            return;
+        }
+        let hits = &view.search_hits;
+        if hits.is_empty() {
+            self.set_status(format!("/{}  — no matches", view.search), StatusKind::Info);
+            return;
+        }
+        let cur = (view.sel_row, view.sel_col);
+        let target = if forward {
+            hits.iter()
+                .find(|&&m| if include_current { m >= cur } else { m > cur })
+                .copied()
+                .unwrap_or(hits[0])
+        } else {
+            hits.iter()
+                .rev()
+                .find(|&&m| if include_current { m <= cur } else { m < cur })
+                .copied()
+                .unwrap_or(*hits.last().unwrap())
+        };
+        let idx = hits.iter().position(|&m| m == target).unwrap_or(0);
+        let total = hits.len();
+        let term = view.search.clone();
+        let view = self.view.as_mut().unwrap();
+        view.sel_row = target.0;
+        view.sel_col = target.1;
+        self.set_status(format!("/{term}  [{}/{total}]", idx + 1), StatusKind::Info);
+    }
+
     fn results_key(&mut self, key: KeyEvent, ctrl: bool, pending_g: bool) -> Action {
         let page = (self.areas.results.height.saturating_sub(3) as usize).max(1);
         let Some(view) = &mut self.view else {
@@ -1759,6 +1852,44 @@ impl App {
                 _ => Action::None,
             };
         };
+        // Typing a search term: keystrokes rebuild the match set live, highlight
+        // it and jump to the first hit so results track incrementally. Enter
+        // commits (keeping the current match), Esc cancels.
+        if view.searching {
+            let mut term_changed = false;
+            match key.code {
+                KeyCode::Esc => {
+                    view.search.clear();
+                    view.searching = false;
+                    view.search_hits.clear();
+                }
+                KeyCode::Backspace => {
+                    if view.search.pop().is_none() {
+                        view.searching = false;
+                    } else {
+                        term_changed = true;
+                    }
+                }
+                KeyCode::Enter => view.searching = false,
+                KeyCode::Char(c) if !ctrl => {
+                    view.search.push(c);
+                    term_changed = true;
+                }
+                _ => {}
+            }
+            if term_changed {
+                view.refresh_search();
+                if let Some(&(r, c)) = view.search_hits.first() {
+                    view.sel_row = r;
+                    view.sel_col = c;
+                }
+            }
+            if key.code == KeyCode::Enter {
+                // Refresh the status line to the committed [i/total] readout.
+                self.search_jump(true, true);
+            }
+            return Action::None;
+        }
         let max_row = view.rows.len().saturating_sub(1);
         let max_col = view.cols.len().saturating_sub(1);
         match key.code {
@@ -1824,8 +1955,20 @@ impl App {
                 }
             }
             KeyCode::Char('r') => self.run_query(),
+            KeyCode::Char('/') => {
+                view.search.clear();
+                view.search_hits.clear();
+                view.searching = true;
+            }
+            KeyCode::Char('n') => self.search_jump(true, false),
+            KeyCode::Char('p') | KeyCode::Char('N') => self.search_jump(false, false),
             KeyCode::Esc => {
-                if view.vsel.is_some() {
+                if view.searching {
+                    view.searching = false;
+                } else if !view.search.is_empty() {
+                    view.search.clear();
+                    view.search_hits.clear();
+                } else if view.vsel.is_some() {
                     view.vsel = None;
                 } else {
                     self.close_detail();
@@ -2148,6 +2291,76 @@ fn compute_widths(cols: &[ColMeta], rows: &[Vec<Option<String>>]) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn view_with(rows: Vec<Vec<Option<&str>>>) -> QueryView {
+        let cols = vec![
+            ColMeta {
+                name: "a".into(),
+                category: Category::Other,
+            },
+            ColMeta {
+                name: "b".into(),
+                category: Category::Other,
+            },
+        ];
+        let rows = rows
+            .into_iter()
+            .map(|r| r.into_iter().map(|c| c.map(str::to_string)).collect())
+            .collect();
+        QueryView {
+            cols,
+            rows,
+            widths: vec![4, 4],
+            sel_row: 0,
+            sel_col: 0,
+            row_off: 0,
+            col_off: 0,
+            vsel: None,
+            error: None,
+            search: String::new(),
+            searching: false,
+            search_hits: vec![],
+        }
+    }
+
+    #[test]
+    fn search_matches_are_case_insensitive_and_row_major() {
+        let mut view = view_with(vec![
+            vec![Some("Foo"), Some("bar")],
+            vec![Some("baz"), Some("FOObar")],
+        ]);
+        view.search = "foo".into();
+        // (0,0) "Foo" and (1,1) "FOObar", in row-major order.
+        assert_eq!(view.matches(), vec![(0, 0), (1, 1)]);
+    }
+
+    #[test]
+    fn search_ignores_null_and_empty_term() {
+        let mut view = view_with(vec![vec![None, Some("hit")]]);
+        assert!(view.matches().is_empty()); // no term yet
+        view.search = "hit".into();
+        assert_eq!(view.matches(), vec![(0, 1)]);
+    }
+
+    #[test]
+    fn refresh_caches_hits_and_reports_current_index() {
+        let mut view = view_with(vec![
+            vec![Some("apple"), Some("pear")],
+            vec![Some("grape"), Some("apple")],
+        ]);
+        view.search = "apple".into();
+        view.refresh_search();
+        assert_eq!(view.search_hits, vec![(0, 0), (1, 1)]);
+        // Cursor starts at (0,0) — the first hit.
+        assert_eq!(view.search_index(), Some(0));
+        // Move onto the second hit.
+        view.sel_row = 1;
+        view.sel_col = 1;
+        assert_eq!(view.search_index(), Some(1));
+        // A cell that is not a match reports no index.
+        view.sel_col = 0;
+        assert_eq!(view.search_index(), None);
+    }
 
     #[test]
     fn preview_query_uses_engine_dialect_and_escapes_identifiers() {
