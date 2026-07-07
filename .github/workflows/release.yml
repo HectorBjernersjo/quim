@@ -43,7 +43,7 @@ jobs:
 
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
-          bin: qb
+          bin: quim
           target: ${{ matrix.target }}
           archive: $bin-$target
           tar: unix
