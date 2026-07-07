@@ -1,7 +1,0 @@
-node_modules/
-dist/
-*.log
-# Config now lives in ~/.config/querybench (outside the repo). These are only
-# legacy in-repo files, ignored just in case one shows up.
-sources.json
-connections.json
