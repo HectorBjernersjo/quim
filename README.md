@@ -5,6 +5,26 @@ but in the terminal, built for vim fingers. **Shares its config with querybench*
 (`~/.config/querybench/config.json`), so databases added there show up right away,
 and sources added in qb show up in querybench.
 
+## Install
+
+**Linux / macOS:**
+
+```sh
+curl -fsSL https://github.com/HectorBjernersjo/querybench/releases/latest/download/install.sh | sh
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://github.com/HectorBjernersjo/querybench/releases/latest/download/install.ps1 | iex
+```
+
+**From source** (requires a Rust toolchain):
+
+```sh
+cargo install --git https://github.com/HectorBjernersjo/querybench
+```
+
 ## Run
 
 ```bash

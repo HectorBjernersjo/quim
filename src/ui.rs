@@ -370,7 +370,7 @@ fn draw_editor(f: &mut Frame, app: &mut App, area: Rect) {
                 (x1 - x0) as u16,
                 1,
             );
-            f.buffer_mut().set_style(rect, Style::new().bg(theme::PANEL2));
+            f.buffer_mut().set_style(rect, Style::new().bg(theme::SEL));
         }
     }
 
