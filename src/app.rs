@@ -46,6 +46,7 @@ pub struct DbEntry {
     pub id: String,
     pub name: String,
     pub label: String,
+    pub engine: String,
     pub server: Option<String>,
     pub conn: String,
     pub database: String,
@@ -75,7 +76,8 @@ pub struct QueryView {
 impl QueryView {
     /// The inclusive row range selected with V, if any.
     pub fn vsel_range(&self) -> Option<(usize, usize)> {
-        self.vsel.map(|a| (a.min(self.sel_row), a.max(self.sel_row)))
+        self.vsel
+            .map(|a| (a.min(self.sel_row), a.max(self.sel_row)))
     }
 }
 
@@ -106,6 +108,7 @@ pub enum SourceKind {
 #[derive(Clone, Copy, PartialEq)]
 pub enum FormField {
     Kind,
+    Engine,
     Name,
     Conn,
     Fetch,
@@ -118,6 +121,7 @@ pub enum FormField {
 #[derive(Clone)]
 pub struct SourceForm {
     pub kind: SourceKind,
+    pub engine: String,
     pub editing_id: Option<String>,
     pub name: String,
     pub conn: String,
@@ -135,6 +139,7 @@ impl SourceForm {
     fn new_add() -> Self {
         SourceForm {
             kind: SourceKind::Server,
+            engine: "mssql".into(),
             editing_id: None,
             name: String::new(),
             conn: String::new(),
@@ -155,9 +160,10 @@ impl SourceForm {
         if self.editing_id.is_none() {
             out.push(FormField::Kind);
         }
+        out.push(FormField::Engine);
         out.push(FormField::Name);
         out.push(FormField::Conn);
-        if self.kind == SourceKind::Server {
+        if self.kind == SourceKind::Server && config::supports_server_sources(&self.engine) {
             out.push(FormField::Fetch);
             out.push(FormField::AllToggle);
             if !self.all_dbs && !self.db_list.is_empty() {
@@ -186,6 +192,22 @@ impl SourceForm {
             FormField::Name => Some(&mut self.name),
             FormField::Conn => Some(&mut self.conn),
             _ => None,
+        }
+    }
+
+    fn cycle_engine(&mut self) {
+        const ENGINES: &[&str] = &["mssql", "postgres", "sqlite"];
+        let current = config::normalize_engine(&self.engine);
+        let idx = ENGINES
+            .iter()
+            .position(|engine| *engine == current)
+            .unwrap_or(0);
+        self.engine = ENGINES[(idx + 1) % ENGINES.len()].into();
+        if !config::supports_server_sources(&self.engine)
+            && self.kind == SourceKind::Server
+            && self.editing_id.is_none()
+        {
+            self.kind = SourceKind::Database;
         }
     }
 }
@@ -250,7 +272,7 @@ pub struct App {
 
 impl App {
     pub fn new(cfg: Config, req_tx: Sender<DbRequest>) -> Self {
-        let editor = Editor::new("SELECT 1", cfg.qb.vim_mode);
+        let editor = Editor::new("SELECT 1", cfg.quim.vim_mode);
         let mut app = App {
             cfg,
             req_tx,
@@ -291,9 +313,22 @@ impl App {
             return;
         }
         for server in self.cfg.servers.clone() {
-            if server.engine != "mssql" {
+            if !config::supported_engine(&server.engine) {
                 self.set_status(
-                    format!("{}: engine \"{}\" is not supported yet", server.name, server.engine),
+                    format!(
+                        "{}: engine \"{}\" is not supported yet",
+                        server.name, server.engine
+                    ),
+                    StatusKind::Err,
+                );
+                continue;
+            }
+            if !config::supports_server_sources(&server.engine) {
+                self.set_status(
+                    format!(
+                        "{}: SQLite sources must be standalone databases",
+                        server.name
+                    ),
                     StatusKind::Err,
                 );
                 continue;
@@ -302,6 +337,7 @@ impl App {
                 self.pending_servers += 1;
                 let _ = self.req_tx.send(DbRequest::ListDatabases {
                     server_id: server.id.clone(),
+                    engine: server.engine.clone(),
                     conn: server.connection_string.clone(),
                 });
             }
@@ -315,7 +351,7 @@ impl App {
     fn rebuild_entries(&mut self) {
         let mut out: Vec<DbEntry> = vec![];
         for s in &self.cfg.servers {
-            if s.engine != "mssql" {
+            if !config::supported_engine(&s.engine) || !config::supports_server_sources(&s.engine) {
                 continue;
             }
             let names: Vec<String> = match &s.databases {
@@ -329,6 +365,7 @@ impl App {
                     id: format!("s:{}:{}", s.id, name),
                     name: name.clone(),
                     label: String::new(),
+                    engine: config::normalize_engine(&s.engine),
                     server: Some(s.name.clone()),
                     conn: s.connection_string.clone(),
                     database: name,
@@ -336,20 +373,22 @@ impl App {
             }
         }
         for d in &self.cfg.databases {
-            if d.engine != "mssql" {
+            if !config::supported_engine(&d.engine) {
                 continue;
             }
-            let database = config::database_of(&d.connection_string).unwrap_or_else(|| d.name.clone());
+            let database = config::database_of_engine(&d.engine, &d.connection_string)
+                .unwrap_or_else(|| d.name.clone());
             out.push(DbEntry {
                 id: format!("d:{}", d.id),
                 name: d.name.clone(),
                 label: String::new(),
+                engine: config::normalize_engine(&d.engine),
                 server: None,
                 conn: d.connection_string.clone(),
                 database,
             });
         }
-        // Disambiguate labels only on name collisions, like querybench.
+        // Disambiguate labels only on name collisions.
         let mut counts: HashMap<&str, usize> = HashMap::new();
         for e in &out {
             *counts.entry(e.name.as_str()).or_default() += 1;
@@ -378,7 +417,7 @@ impl App {
             // database wins once its server reports in.
             let remembered = self
                 .cfg
-                .qb
+                .quim
                 .active_db
                 .as_ref()
                 .and_then(|id| self.dbs.iter().find(|d| &d.id == id))
@@ -401,12 +440,13 @@ impl App {
         self.set_status("Loading schema…".into(), StatusKind::Info);
         let _ = self.req_tx.send(DbRequest::Schema {
             db_id: entry.id.clone(),
+            engine: entry.engine.clone(),
             conn: entry.conn.clone(),
             database: entry.database.clone(),
         });
         // Remember the selection across restarts.
-        if self.cfg.qb.active_db.as_deref() != Some(entry.id.as_str()) {
-            self.cfg.qb.active_db = Some(entry.id.clone());
+        if self.cfg.quim.active_db.as_deref() != Some(entry.id.as_str()) {
+            self.cfg.quim.active_db = Some(entry.id.clone());
             if let Err(e) = config::save(&self.cfg) {
                 self.set_status(format!("✕ {e}"), StatusKind::Err);
             }
@@ -436,7 +476,10 @@ impl App {
             .iter()
             .enumerate()
             .filter(|(_, t)| {
-                f.is_empty() || format!("{}.{}", t.schema, t.name).to_lowercase().contains(&f)
+                f.is_empty()
+                    || format!("{}.{}", t.schema, t.name)
+                        .to_lowercase()
+                        .contains(&f)
             })
             .map(|(i, _)| i)
             .collect()
@@ -455,9 +498,7 @@ impl App {
                 match result {
                     Ok(names) => {
                         self.server_dbs.insert(server_id, names);
-                        if self.pending_servers == 0
-                            && matches!(self.status.1, StatusKind::Info)
-                        {
+                        if self.pending_servers == 0 && matches!(self.status.1, StatusKind::Info) {
                             self.set_status(String::new(), StatusKind::Info);
                         }
                     }
@@ -497,7 +538,12 @@ impl App {
     }
 
     fn apply_query_result(&mut self, outcome: QueryOutcome) {
-        let QueryOutcome { columns, rows, error, elapsed_ms } = outcome;
+        let QueryOutcome {
+            columns,
+            rows,
+            error,
+            elapsed_ms,
+        } = outcome;
         if let Some(err) = &error {
             self.set_status(format!("✕ {elapsed_ms} ms"), StatusKind::Err);
             self.view = Some(QueryView {
@@ -553,7 +599,12 @@ impl App {
         }
         self.running = true;
         self.set_status("Running…".into(), StatusKind::Info);
-        let _ = self.req_tx.send(DbRequest::Query { conn: active.conn, database: active.database, sql });
+        let _ = self.req_tx.send(DbRequest::Query {
+            engine: active.engine,
+            conn: active.conn,
+            database: active.database,
+            sql,
+        });
     }
 
     fn yank(&mut self, text: String, what: &str) {
@@ -565,11 +616,20 @@ impl App {
 
     fn open_detail(&mut self) {
         let Some(view) = &self.view else { return };
-        let Some(row) = view.rows.get(view.sel_row) else { return };
-        let Some(cell) = row.get(view.sel_col) else { return };
+        let Some(row) = view.rows.get(view.sel_row) else {
+            return;
+        };
+        let Some(cell) = row.get(view.sel_col) else {
+            return;
+        };
         let title = view.cols[view.sel_col].name.clone();
         let pretty_json = cell.as_deref().and_then(highlight::try_pretty_json);
-        self.detail = Some(Detail { title, value: cell.clone(), pretty_json, scroll: 0 });
+        self.detail = Some(Detail {
+            title,
+            value: cell.clone(),
+            pretty_json,
+            scroll: 0,
+        });
         self.focus = Pane::Detail;
     }
 
@@ -762,7 +822,7 @@ impl App {
         }
         let areas = self.areas;
         let detail_open = self.detail.is_some();
-        let lay = &mut self.cfg.qb.layout;
+        let lay = &mut self.cfg.quim.layout;
         match self.focus {
             // right wall = sidebar boundary, bottom wall = db/tables boundary
             Pane::Databases => {
@@ -825,7 +885,9 @@ impl App {
     }
 
     fn settings_key(&mut self, key: KeyEvent) -> Action {
-        let Some(st) = self.settings.as_ref() else { return Action::None };
+        let Some(st) = self.settings.as_ref() else {
+            return Action::None;
+        };
         let (section, in_content) = (st.section, st.in_content);
         match key.code {
             KeyCode::Char('q') | KeyCode::Char(',') => {
@@ -873,7 +935,10 @@ impl App {
         {
             let st = self.settings.as_mut().unwrap();
             match key.code {
-                KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left | KeyCode::Tab
+                KeyCode::Esc
+                | KeyCode::Char('h')
+                | KeyCode::Left
+                | KeyCode::Tab
                 | KeyCode::BackTab => {
                     st.in_content = false;
                     return Action::None;
@@ -913,8 +978,8 @@ impl App {
     }
 
     fn toggle_vim_mode(&mut self) {
-        let on = !self.cfg.qb.vim_mode;
-        self.cfg.qb.vim_mode = on;
+        let on = !self.cfg.quim.vim_mode;
+        self.cfg.quim.vim_mode = on;
         if on {
             self.editor.mode = Mode::Normal;
             self.editor.clamp_normal_col();
@@ -931,7 +996,7 @@ impl App {
     }
 
     fn reset_layout(&mut self) {
-        self.cfg.qb.layout = config::LayoutCfg::default();
+        self.cfg.quim.layout = config::LayoutCfg::default();
         match config::save(&self.cfg) {
             Ok(()) => self.set_status("Pane layout reset".into(), StatusKind::Ok),
             Err(e) => self.set_status(format!("✕ {e}"), StatusKind::Err),
@@ -950,12 +1015,16 @@ impl App {
 
     fn settings_edit(&mut self, section: SettingsSection, row: usize) {
         let target = match section {
-            SettingsSection::Servers => {
-                self.cfg.servers.get(row).map(|s| SourceTarget::Server(s.id.clone()))
-            }
-            SettingsSection::Databases => {
-                self.cfg.databases.get(row).map(|d| SourceTarget::Database(d.id.clone()))
-            }
+            SettingsSection::Servers => self
+                .cfg
+                .servers
+                .get(row)
+                .map(|s| SourceTarget::Server(s.id.clone())),
+            SettingsSection::Databases => self
+                .cfg
+                .databases
+                .get(row)
+                .map(|d| SourceTarget::Database(d.id.clone())),
             SettingsSection::General => None,
         };
         if let Some(target) = target {
@@ -986,21 +1055,37 @@ impl App {
     }
 
     fn settings_test(&mut self, section: SettingsSection, row: usize) {
-        let (name, conn, database) = match section {
+        let (name, engine, conn, database) = match section {
             SettingsSection::Servers => {
-                let Some(s) = self.cfg.servers.get(row) else { return };
-                (s.name.clone(), s.connection_string.clone(), "master".to_string())
+                let Some(s) = self.cfg.servers.get(row) else {
+                    return;
+                };
+                (
+                    s.name.clone(),
+                    config::normalize_engine(&s.engine),
+                    s.connection_string.clone(),
+                    config::server_test_database(&s.engine),
+                )
             }
             SettingsSection::Databases => {
-                let Some(d) = self.cfg.databases.get(row) else { return };
-                let db = config::database_of(&d.connection_string).unwrap_or_default();
-                (d.name.clone(), d.connection_string.clone(), db)
+                let Some(d) = self.cfg.databases.get(row) else {
+                    return;
+                };
+                let db =
+                    config::database_of_engine(&d.engine, &d.connection_string).unwrap_or_default();
+                (
+                    d.name.clone(),
+                    config::normalize_engine(&d.engine),
+                    d.connection_string.clone(),
+                    db,
+                )
             }
             SettingsSection::General => return,
         };
         self.set_status(format!("Testing {name}…"), StatusKind::Info);
         let _ = self.req_tx.send(DbRequest::TestConnection {
             token: format!("@ping:{name}"),
+            engine,
             conn,
             database,
         });
@@ -1014,9 +1099,13 @@ impl App {
     }
 
     fn open_edit_form(&mut self) {
-        let Some(&idx) = self.filtered_dbs().get(self.db_list.sel) else { return };
+        let Some(&idx) = self.filtered_dbs().get(self.db_list.sel) else {
+            return;
+        };
         let entry = self.dbs[idx].clone();
-        let Some((target, _)) = self.source_of(&entry) else { return };
+        let Some((target, _)) = self.source_of(&entry) else {
+            return;
+        };
         self.open_edit_form_for(target);
     }
 
@@ -1026,8 +1115,11 @@ impl App {
         form.focus = FormField::Name;
         match target {
             SourceTarget::Server(id) => {
-                let Some(s) = self.cfg.servers.iter().find(|s| s.id == id) else { return };
+                let Some(s) = self.cfg.servers.iter().find(|s| s.id == id) else {
+                    return;
+                };
                 form.kind = SourceKind::Server;
+                form.engine = config::normalize_engine(&s.engine);
                 form.editing_id = Some(s.id.clone());
                 form.name = s.name.clone();
                 form.conn = s.connection_string.clone();
@@ -1037,8 +1129,11 @@ impl App {
                 }
             }
             SourceTarget::Database(id) => {
-                let Some(d) = self.cfg.databases.iter().find(|d| d.id == id) else { return };
+                let Some(d) = self.cfg.databases.iter().find(|d| d.id == id) else {
+                    return;
+                };
                 form.kind = SourceKind::Database;
+                form.engine = config::normalize_engine(&d.engine);
                 form.editing_id = Some(d.id.clone());
                 form.name = d.name.clone();
                 form.conn = d.connection_string.clone();
@@ -1059,16 +1154,24 @@ impl App {
                 .find(|s| s.id == srv_id)
                 .map(|s| s.name.clone())
                 .unwrap_or_else(|| srv_id.to_string());
-            Some((SourceTarget::Server(srv_id.to_string()), format!("server \"{name}\"")))
+            Some((
+                SourceTarget::Server(srv_id.to_string()),
+                format!("server \"{name}\""),
+            ))
         } else if let Some(id) = entry.id.strip_prefix("d:") {
-            Some((SourceTarget::Database(id.to_string()), format!("database \"{}\"", entry.name)))
+            Some((
+                SourceTarget::Database(id.to_string()),
+                format!("database \"{}\"", entry.name),
+            ))
         } else {
             None
         }
     }
 
     fn open_confirm_delete(&mut self) {
-        let Some(&idx) = self.filtered_dbs().get(self.db_list.sel) else { return };
+        let Some(&idx) = self.filtered_dbs().get(self.db_list.sel) else {
+            return;
+        };
         let entry = self.dbs[idx].clone();
         if let Some((target, label)) = self.source_of(&entry) {
             let note = match &target {
@@ -1080,7 +1183,9 @@ impl App {
     }
 
     fn confirm_key(&mut self, key: KeyEvent) -> Action {
-        let Some((_, target)) = self.confirm.take() else { return Action::None };
+        let Some((_, target)) = self.confirm.take() else {
+            return Action::None;
+        };
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 match &target {
@@ -1102,7 +1207,9 @@ impl App {
     }
 
     fn form_key(&mut self, key: KeyEvent, ctrl: bool) -> Action {
-        let Some(form) = self.form.as_mut() else { return Action::None };
+        let Some(form) = self.form.as_mut() else {
+            return Action::None;
+        };
         if form.saving {
             // Only Esc is honored while the connection test runs.
             if key.code == KeyCode::Esc {
@@ -1137,7 +1244,9 @@ impl App {
                     form.cursor = (form.cursor + 1).min(len);
                 }
                 KeyCode::Home => form.cursor = 0,
-                KeyCode::End => form.cursor = form.text_field().map(|t| t.chars().count()).unwrap_or(0),
+                KeyCode::End => {
+                    form.cursor = form.text_field().map(|t| t.chars().count()).unwrap_or(0)
+                }
                 KeyCode::Backspace => {
                     let cur = form.cursor;
                     if cur > 0 {
@@ -1174,16 +1283,31 @@ impl App {
                 _ => {}
             },
             FormField::Kind => match key.code {
-                KeyCode::Char('h') | KeyCode::Char('l') | KeyCode::Char(' ')
-                | KeyCode::Left | KeyCode::Right | KeyCode::Enter => {
-                    form.kind = if form.kind == SourceKind::Server {
-                        SourceKind::Database
-                    } else {
-                        SourceKind::Server
-                    };
+                KeyCode::Char('h')
+                | KeyCode::Char('l')
+                | KeyCode::Char(' ')
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Enter => {
+                    if form.kind == SourceKind::Server {
+                        form.kind = SourceKind::Database;
+                    } else if config::supports_server_sources(&form.engine) {
+                        form.kind = SourceKind::Server;
+                    }
                 }
                 KeyCode::Up => form.move_focus(-1),
                 KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k') => form.move_focus(1),
+                _ => {}
+            },
+            FormField::Engine => match key.code {
+                KeyCode::Char('h')
+                | KeyCode::Char('l')
+                | KeyCode::Char(' ')
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Enter => form.cycle_engine(),
+                KeyCode::Up | KeyCode::Char('k') => form.move_focus(-1),
+                KeyCode::Down | KeyCode::Char('j') => form.move_focus(1),
                 _ => {}
             },
             FormField::AllToggle => match key.code {
@@ -1242,15 +1366,23 @@ impl App {
 
     fn form_fetch(&mut self) {
         let token = self.form_token;
-        let Some(form) = self.form.as_mut() else { return };
+        let Some(form) = self.form.as_mut() else {
+            return;
+        };
         if form.conn.trim().is_empty() {
             form.error = Some("Enter a connection string first".into());
+            return;
+        }
+        if !config::supports_server_sources(&form.engine) {
+            form.error =
+                Some("SQLite is a single database file; add it as a database source.".into());
             return;
         }
         form.error = None;
         form.fetching = true;
         let _ = self.req_tx.send(DbRequest::ListDatabases {
             server_id: format!("@form:{token}"),
+            engine: config::normalize_engine(&form.engine),
             conn: form.conn.trim().to_string(),
         });
     }
@@ -1259,7 +1391,9 @@ impl App {
         if server_id != format!("@form:{}", self.form_token) {
             return; // stale response from a closed form
         }
-        let Some(form) = self.form.as_mut() else { return };
+        let Some(form) = self.form.as_mut() else {
+            return;
+        };
         form.fetching = false;
         match result {
             Ok(names) => {
@@ -1280,7 +1414,9 @@ impl App {
 
     fn form_save(&mut self) {
         let token = self.form_token;
-        let Some(form) = self.form.as_mut() else { return };
+        let Some(form) = self.form.as_mut() else {
+            return;
+        };
         form.name = form.name.trim().to_string();
         form.conn = form.conn.trim().to_string();
         if form.name.is_empty() {
@@ -1289,6 +1425,16 @@ impl App {
         }
         if form.conn.is_empty() {
             form.error = Some("Connection string is required".into());
+            return;
+        }
+        form.engine = config::normalize_engine(&form.engine);
+        if !config::supported_engine(&form.engine) {
+            form.error = Some(format!("Engine \"{}\" is not supported", form.engine));
+            return;
+        }
+        if form.kind == SourceKind::Server && !config::supports_server_sources(&form.engine) {
+            form.error =
+                Some("SQLite is a single database file; add it as a database source.".into());
             return;
         }
         if form.kind == SourceKind::Server
@@ -1301,11 +1447,14 @@ impl App {
         form.error = None;
         form.saving = true;
         let database = match form.kind {
-            SourceKind::Server => "master".to_string(),
-            SourceKind::Database => config::database_of(&form.conn).unwrap_or_default(),
+            SourceKind::Server => config::server_test_database(&form.engine),
+            SourceKind::Database => {
+                config::database_of_engine(&form.engine, &form.conn).unwrap_or_default()
+            }
         };
         let _ = self.req_tx.send(DbRequest::TestConnection {
             token: format!("@save:{token}"),
+            engine: form.engine.clone(),
             conn: form.conn.clone(),
             database,
         });
@@ -1323,7 +1472,9 @@ impl App {
         if token != format!("@save:{}", self.form_token) {
             return;
         }
-        let Some(form) = self.form.as_mut() else { return };
+        let Some(form) = self.form.as_mut() else {
+            return;
+        };
         form.saving = false;
         match result {
             Err(e) => form.error = Some(format!("Could not connect: {e}")),
@@ -1332,15 +1483,25 @@ impl App {
     }
 
     fn commit_form(&mut self) {
-        let Some(form) = self.form.clone() else { return };
+        let Some(form) = self.form.clone() else {
+            return;
+        };
+        let engine = config::normalize_engine(&form.engine);
         match form.kind {
             SourceKind::Server => {
-                let id = form.editing_id.clone().unwrap_or_else(|| config::new_id("srv"));
+                let id = form
+                    .editing_id
+                    .clone()
+                    .unwrap_or_else(|| config::new_id("srv"));
                 let databases = if form.all_dbs {
                     DbSelection::all()
                 } else {
                     DbSelection::Named(
-                        form.db_list.iter().filter(|(_, on)| *on).map(|(n, _)| n.clone()).collect(),
+                        form.db_list
+                            .iter()
+                            .filter(|(_, on)| *on)
+                            .map(|(n, _)| n.clone())
+                            .collect(),
                     )
                 };
                 let extra = self
@@ -1353,7 +1514,7 @@ impl App {
                 let entry = ServerCfg {
                     id: id.clone(),
                     name: form.name.clone(),
-                    engine: "mssql".into(),
+                    engine: engine.clone(),
                     connection_string: form.conn.clone(),
                     databases,
                     extra,
@@ -1374,12 +1535,16 @@ impl App {
                     self.pending_servers += 1;
                     let _ = self.req_tx.send(DbRequest::ListDatabases {
                         server_id: id,
+                        engine,
                         conn: form.conn.clone(),
                     });
                 }
             }
             SourceKind::Database => {
-                let id = form.editing_id.clone().unwrap_or_else(|| config::new_id("db"));
+                let id = form
+                    .editing_id
+                    .clone()
+                    .unwrap_or_else(|| config::new_id("db"));
                 let extra = self
                     .cfg
                     .databases
@@ -1390,7 +1555,7 @@ impl App {
                 let entry = DatabaseCfg {
                     id: id.clone(),
                     name: form.name.clone(),
-                    engine: "mssql".into(),
+                    engine,
                     connection_string: form.conn.clone(),
                     extra,
                 };
@@ -1432,7 +1597,14 @@ impl App {
             }
         }
         let len = self.filtered_dbs().len();
-        if let Some(action) = list_common(&mut self.db_list, len, key, pending_g, &mut self.pending_g, &mut self.show_help) {
+        if let Some(action) = list_common(
+            &mut self.db_list,
+            len,
+            key,
+            pending_g,
+            &mut self.pending_g,
+            &mut self.show_help,
+        ) {
             return action;
         }
         if key.code == KeyCode::Enter && !self.db_list.typing {
@@ -1450,13 +1622,25 @@ impl App {
 
     fn tbl_list_key(&mut self, key: KeyEvent, pending_g: bool) -> Action {
         let len = self.filtered_tables().len();
-        if let Some(action) = list_common(&mut self.tbl_list, len, key, pending_g, &mut self.pending_g, &mut self.show_help) {
+        if let Some(action) = list_common(
+            &mut self.tbl_list,
+            len,
+            key,
+            pending_g,
+            &mut self.pending_g,
+            &mut self.show_help,
+        ) {
             return action;
         }
         if key.code == KeyCode::Enter && !self.tbl_list.typing {
             if let Some(&idx) = self.filtered_tables().get(self.tbl_list.sel) {
                 let t = &self.tables[idx];
-                let sql = format!("SELECT TOP 100 *\nFROM [{}].[{}]", t.schema, t.name);
+                let engine = self
+                    .active
+                    .as_ref()
+                    .map(|db| db.engine.as_str())
+                    .unwrap_or("mssql");
+                let sql = preview_query(engine, &t.schema, &t.name);
                 self.editor.set_text(&sql);
                 self.focus = Pane::Results;
                 self.run_query();
@@ -1472,7 +1656,7 @@ impl App {
             return Action::ExternalEdit;
         }
         // Modal editing: normal/visual mode keys live in vim.rs.
-        if self.cfg.qb.vim_mode && self.editor.mode != Mode::Insert {
+        if self.cfg.quim.vim_mode && self.editor.mode != Mode::Insert {
             match vim::handle_key(&mut self.editor, key) {
                 vim::Outcome::Consumed => {}
                 vim::Outcome::RunQuery => self.run_query(),
@@ -1527,7 +1711,7 @@ impl App {
             KeyCode::Esc => {
                 if self.editor.completion.is_some() {
                     self.editor.completion = None;
-                } else if self.cfg.qb.vim_mode {
+                } else if self.cfg.quim.vim_mode {
                     // Like vim: leaving insert mode steps the cursor back one.
                     self.editor.mode = Mode::Normal;
                     self.editor.col = self.editor.col.saturating_sub(1);
@@ -1615,8 +1799,10 @@ impl App {
                     view.vsel = None;
                     let n = hi - lo + 1;
                     self.yank(text, &format!("{n} row(s) as JSON"));
-                } else if let Some(cell) =
-                    view.rows.get(view.sel_row).and_then(|r| r.get(view.sel_col))
+                } else if let Some(cell) = view
+                    .rows
+                    .get(view.sel_row)
+                    .and_then(|r| r.get(view.sel_col))
                 {
                     let text = cell.clone().unwrap_or_default();
                     self.yank(text, "cell");
@@ -1697,17 +1883,21 @@ impl App {
     pub fn on_paste(&mut self, text: String) {
         match self.focus {
             Pane::Editor => {
-                if self.cfg.qb.vim_mode && self.editor.mode != Mode::Insert {
+                if self.cfg.quim.vim_mode && self.editor.mode != Mode::Insert {
                     self.editor.push_undo();
                 }
                 self.editor.insert_str(&text);
             }
             Pane::Databases if self.db_list.typing => {
-                self.db_list.filter.push_str(text.replace(['\n', '\r'], "").as_str());
+                self.db_list
+                    .filter
+                    .push_str(text.replace(['\n', '\r'], "").as_str());
                 self.db_list.sel = 0;
             }
             Pane::Tables if self.tbl_list.typing => {
-                self.tbl_list.filter.push_str(text.replace(['\n', '\r'], "").as_str());
+                self.tbl_list
+                    .filter
+                    .push_str(text.replace(['\n', '\r'], "").as_str());
                 self.tbl_list.sel = 0;
             }
             _ => {
@@ -1725,8 +1915,34 @@ impl App {
     }
 }
 
+pub fn preview_query(engine: &str, schema: &str, table: &str) -> String {
+    match config::normalize_engine(engine).as_str() {
+        "mssql" => format!(
+            "SELECT TOP 100 *\nFROM {}.{}",
+            bracket_ident(schema),
+            bracket_ident(table)
+        ),
+        _ => format!(
+            "SELECT *\nFROM {}.{}\nLIMIT 100",
+            quote_ident(schema),
+            quote_ident(table)
+        ),
+    }
+}
+
+fn bracket_ident(name: &str) -> String {
+    format!("[{}]", name.replace(']', "]]"))
+}
+
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 fn char_byte(s: &str, char_idx: usize) -> usize {
-    s.char_indices().nth(char_idx).map(|(i, _)| i).unwrap_or(s.len())
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len())
 }
 
 /// Ask the enclosing tmux to move focus in `dir` (no-op outside tmux).
@@ -1866,12 +2082,30 @@ fn rows_as_json(view: &QueryView, lo: usize, hi: usize) -> String {
 
 /// V-selected rows as a markdown table (NULL shown as empty cells).
 fn rows_as_markdown(view: &QueryView, lo: usize, hi: usize) -> String {
-    let esc = |s: &str| s.replace('\\', "\\\\").replace('|', "\\|").replace(['\n', '\r'], " ");
+    let esc = |s: &str| {
+        s.replace('\\', "\\\\")
+            .replace('|', "\\|")
+            .replace(['\n', '\r'], " ")
+    };
     let mut out = String::new();
     out.push_str("| ");
-    out.push_str(&view.cols.iter().map(|c| esc(&c.name)).collect::<Vec<_>>().join(" | "));
+    out.push_str(
+        &view
+            .cols
+            .iter()
+            .map(|c| esc(&c.name))
+            .collect::<Vec<_>>()
+            .join(" | "),
+    );
     out.push_str(" |\n| ");
-    out.push_str(&view.cols.iter().map(|_| "---").collect::<Vec<_>>().join(" | "));
+    out.push_str(
+        &view
+            .cols
+            .iter()
+            .map(|_| "---")
+            .collect::<Vec<_>>()
+            .join(" | "),
+    );
     out.push_str(" |\n");
     for row in &view.rows[lo..=hi.min(view.rows.len() - 1)] {
         out.push_str("| ");
@@ -1879,7 +2113,13 @@ fn rows_as_markdown(view: &QueryView, lo: usize, hi: usize) -> String {
             .cols
             .iter()
             .enumerate()
-            .map(|(i, _)| row.get(i).cloned().flatten().map(|s| esc(&s)).unwrap_or_default())
+            .map(|(i, _)| {
+                row.get(i)
+                    .cloned()
+                    .flatten()
+                    .map(|s| esc(&s))
+                    .unwrap_or_default()
+            })
             .collect();
         out.push_str(&cells.join(" | "));
         out.push_str(" |\n");
@@ -1903,4 +2143,25 @@ fn compute_widths(cols: &[ColMeta], rows: &[Vec<Option<String>>]) -> Vec<u16> {
             data_w.clamp(4, 60).max(col.name.width().min(200)) as u16
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_query_uses_engine_dialect_and_escapes_identifiers() {
+        assert_eq!(
+            preview_query("mssql", "dbo", "weird]name"),
+            "SELECT TOP 100 *\nFROM [dbo].[weird]]name]"
+        );
+        assert_eq!(
+            preview_query("postgres", "public", "weird\"name"),
+            "SELECT *\nFROM \"public\".\"weird\"\"name\"\nLIMIT 100"
+        );
+        assert_eq!(
+            preview_query("sqlite", "main", "people"),
+            "SELECT *\nFROM \"main\".\"people\"\nLIMIT 100"
+        );
+    }
 }

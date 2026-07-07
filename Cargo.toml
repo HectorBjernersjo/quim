@@ -1,8 +1,8 @@
 [package]
-name = "qb"
+name = "quim"
 version = "0.1.0"
 edition = "2021"
-description = "TUI for running SQL against MSSQL databases — shares config with querybench"
+description = "TUI for running SQL against MSSQL, PostgreSQL and SQLite databases, built for vim fingers"
 
 [dependencies]
 ratatui = "0.29"
@@ -14,7 +14,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4"
 unicode-width = "0.2"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "sqlite", "chrono", "uuid", "bigdecimal"] }
 
 [profile.release]
 lto = true
 strip = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

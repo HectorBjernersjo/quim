@@ -8,6 +8,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::app::{
     App, FilterList, FormField, Pane, SettingsSection, SourceKind, StatusKind, GENERAL_ROWS,
 };
+use crate::config;
 use crate::db::Category;
 use crate::editor::{CompKind, Mode};
 use crate::highlight;
@@ -18,8 +19,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     f.render_widget(Block::new().style(Style::new().bg(theme::BG)), area);
 
-    let lay = app.cfg.qb.layout;
-    let [main, status_a] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
+    let lay = app.cfg.quim.layout;
+    let [main, status_a] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
 
     // The settings screen replaces the whole workspace; popups still stack on top.
     if app.settings.is_some() {
@@ -117,10 +119,30 @@ fn resize_walls(app: &App) -> Vec<Rect> {
     if a.width == 0 || a.height == 0 {
         return vec![];
     }
-    let left = Rect { x: a.x, y: a.y, width: 1, height: a.height };
-    let right = Rect { x: a.x + a.width - 1, y: a.y, width: 1, height: a.height };
-    let top = Rect { x: a.x, y: a.y, width: a.width, height: 1 };
-    let bottom = Rect { x: a.x, y: a.y + a.height - 1, width: a.width, height: 1 };
+    let left = Rect {
+        x: a.x,
+        y: a.y,
+        width: 1,
+        height: a.height,
+    };
+    let right = Rect {
+        x: a.x + a.width - 1,
+        y: a.y,
+        width: 1,
+        height: a.height,
+    };
+    let top = Rect {
+        x: a.x,
+        y: a.y,
+        width: a.width,
+        height: 1,
+    };
+    let bottom = Rect {
+        x: a.x,
+        y: a.y + a.height - 1,
+        width: a.width,
+        height: 1,
+    };
     match app.focus {
         Pane::Databases => vec![right, bottom],
         Pane::Tables => vec![right, top],
@@ -131,7 +153,11 @@ fn resize_walls(app: &App) -> Vec<Rect> {
 }
 
 fn pane_block(title: &str, focused: bool) -> Block<'static> {
-    let border = if focused { theme::ACCENT_DIM } else { theme::BORDER };
+    let border = if focused {
+        theme::ACCENT_DIM
+    } else {
+        theme::BORDER
+    };
     let title_style = if focused {
         Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
     } else {
@@ -159,7 +185,12 @@ fn filter_line(list: &FilterList, focused: bool) -> Option<Line<'static>> {
     ]))
 }
 
-fn scroll_window(sel: usize, len: usize, height: usize, scroll: &mut usize) -> std::ops::Range<usize> {
+fn scroll_window(
+    sel: usize,
+    len: usize,
+    height: usize,
+    scroll: &mut usize,
+) -> std::ops::Range<usize> {
     if height == 0 || len == 0 {
         return 0..0;
     }
@@ -195,7 +226,12 @@ fn draw_db_list(f: &mut Frame, app: &mut App, area: Rect) {
 
     let filtered = app.filtered_dbs();
     app.db_list.sel = app.db_list.sel.min(filtered.len().saturating_sub(1));
-    let range = scroll_window(app.db_list.sel, filtered.len(), height, &mut app.db_list.scroll);
+    let range = scroll_window(
+        app.db_list.sel,
+        filtered.len(),
+        height,
+        &mut app.db_list.scroll,
+    );
 
     for pos in range {
         let entry = &app.dbs[filtered[pos]];
@@ -209,7 +245,10 @@ fn draw_db_list(f: &mut Frame, app: &mut App, area: Rect) {
         };
         let mut line = Line::from(vec![
             Span::styled(marker, Style::new().fg(theme::ACCENT_DIM)),
-            Span::styled(fit(&entry.label, inner.width.saturating_sub(3) as usize), name_style),
+            Span::styled(
+                fit(&entry.label, inner.width.saturating_sub(3) as usize),
+                name_style,
+            ),
         ]);
         if is_sel {
             line = line.style(Style::new().bg(theme::PANEL2));
@@ -217,8 +256,14 @@ fn draw_db_list(f: &mut Frame, app: &mut App, area: Rect) {
         lines.push(line);
     }
     if app.dbs.is_empty() && app.pending_servers == 0 {
-        lines.push(Line::styled("  (no databases)", Style::new().fg(theme::FAINT)));
-        lines.push(Line::styled("  , opens settings", Style::new().fg(theme::FAINT)));
+        lines.push(Line::styled(
+            "  (no databases)",
+            Style::new().fg(theme::FAINT),
+        ));
+        lines.push(Line::styled(
+            "  , opens settings",
+            Style::new().fg(theme::FAINT),
+        ));
     }
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -243,7 +288,12 @@ fn draw_table_list(f: &mut Frame, app: &mut App, area: Rect) {
 
     let filtered = app.filtered_tables();
     app.tbl_list.sel = app.tbl_list.sel.min(filtered.len().saturating_sub(1));
-    let range = scroll_window(app.tbl_list.sel, filtered.len(), height, &mut app.tbl_list.scroll);
+    let range = scroll_window(
+        app.tbl_list.sel,
+        filtered.len(),
+        height,
+        &mut app.tbl_list.scroll,
+    );
 
     for pos in range {
         let t = &app.tables[filtered[pos]];
@@ -256,7 +306,11 @@ fn draw_table_list(f: &mut Frame, app: &mut App, area: Rect) {
             Span::raw(" "),
             Span::styled(
                 pad(&fit(&name, name_w), name_w),
-                Style::new().fg(if is_sel && focused { theme::ACCENT } else { theme::TEXT }),
+                Style::new().fg(if is_sel && focused {
+                    theme::ACCENT
+                } else {
+                    theme::TEXT
+                }),
             ),
             Span::raw(" "),
             Span::styled(count, Style::new().fg(theme::FAINT)),
@@ -276,7 +330,7 @@ fn draw_table_list(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn mode_badge(app: &App) -> Option<(&'static str, Color)> {
-    if !app.cfg.qb.vim_mode {
+    if !app.cfg.quim.vim_mode {
         return None;
     }
     if app.editor.vim.cmdline.is_some() {
@@ -292,7 +346,11 @@ fn mode_badge(app: &App) -> Option<(&'static str, Color)> {
 
 fn draw_editor(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Pane::Editor;
-    let db = app.active.as_ref().map(|a| a.label.clone()).unwrap_or_else(|| "—".into());
+    let db = app
+        .active
+        .as_ref()
+        .map(|a| a.label.clone())
+        .unwrap_or_else(|| "—".into());
     let title = match mode_badge(app) {
         Some((badge, _)) if focused => format!("Query · {db} · {badge}"),
         _ => format!("Query · {db}"),
@@ -352,7 +410,11 @@ fn draw_editor(f: &mut Frame, app: &mut App, area: Rect) {
                 (0, len.max(1))
             } else {
                 let s = if row == a.0 { a.1 } else { 0 };
-                let e = if row == b.0 { (b.1 + 1).min(len.max(1)) } else { len.max(1) };
+                let e = if row == b.0 {
+                    (b.1 + 1).min(len.max(1))
+                } else {
+                    len.max(1)
+                };
                 (s.min(len), e)
             };
             let x0 = disp_col(&ed.lines[row], c0);
@@ -386,11 +448,16 @@ fn draw_editor(f: &mut Frame, app: &mut App, area: Rect) {
 
 /// Display column of `char_idx` within `line`.
 fn disp_col(line: &str, char_idx: usize) -> usize {
-    line.chars().take(char_idx).map(|c| c.width().unwrap_or(0)).sum()
+    line.chars()
+        .take(char_idx)
+        .map(|c| c.width().unwrap_or(0))
+        .sum()
 }
 
 fn draw_completion(f: &mut Frame, app: &App, editor_inner: Rect, cur_x: usize) {
-    let Some(comp) = &app.editor.completion else { return };
+    let Some(comp) = &app.editor.completion else {
+        return;
+    };
     let ed = &app.editor;
     let visible = 8usize.min(comp.items.len());
     let width = comp
@@ -405,7 +472,11 @@ fn draw_completion(f: &mut Frame, app: &App, editor_inner: Rect, cur_x: usize) {
     let cursor_col = editor_inner.x + (cur_x - ed.scroll_col) as u16;
     let frame = f.area();
     let below = cursor_row + 1 + visible as u16 <= frame.height;
-    let y = if below { cursor_row + 1 } else { cursor_row.saturating_sub(visible as u16) };
+    let y = if below {
+        cursor_row + 1
+    } else {
+        cursor_row.saturating_sub(visible as u16)
+    };
     let x = cursor_col.min(frame.width.saturating_sub(width));
     let rect = Rect::new(x, y, width.min(frame.width), visible as u16);
 
@@ -435,16 +506,25 @@ fn draw_completion(f: &mut Frame, app: &App, editor_inner: Rect, cur_x: usize) {
             Span::styled(pad(&fit(&item.label, name_w), name_w), style),
             Span::styled(
                 format!(" {tag} "),
-                if selected { style } else { Style::new().fg(tag_color).bg(theme::PANEL2) },
+                if selected {
+                    style
+                } else {
+                    Style::new().fg(tag_color).bg(theme::PANEL2)
+                },
             ),
         ]));
     }
     f.render_widget(Clear, rect);
-    f.render_widget(Paragraph::new(lines).style(Style::new().bg(theme::PANEL2)), rect);
+    f.render_widget(
+        Paragraph::new(lines).style(Style::new().bg(theme::PANEL2)),
+        rect,
+    );
 }
 
 pub fn display_text(cell: &Option<String>, category: Category) -> String {
-    let Some(value) = cell else { return "NULL".into() };
+    let Some(value) = cell else {
+        return "NULL".into();
+    };
     let flat: String = value
         .chars()
         .map(|c| match c {
@@ -594,7 +674,10 @@ fn draw_results(f: &mut Frame, app: &mut App, area: Rect) {
             pad(&fit(&view.cols[c].name, w), w) + "  ",
             Style::new().fg(theme::MUTED).add_modifier(Modifier::BOLD),
         ));
-        sep.push(Span::styled("─".repeat(w + 2), Style::new().fg(theme::BORDER_SOFT)));
+        sep.push(Span::styled(
+            "─".repeat(w + 2),
+            Style::new().fg(theme::BORDER_SOFT),
+        ));
         used += w + 2;
         if used >= width {
             break;
@@ -638,7 +721,11 @@ fn draw_results(f: &mut Frame, app: &mut App, area: Rect) {
             spans.push(Span::styled(text, style));
             spans.push(Span::styled(
                 "  ",
-                if is_sel_row { Style::new().bg(row_bg) } else { Style::new() },
+                if is_sel_row {
+                    Style::new().bg(row_bg)
+                } else {
+                    Style::new()
+                },
             ));
         }
         lines.push(Line::from(spans));
@@ -648,7 +735,9 @@ fn draw_results(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Pane::Detail;
-    let Some(detail) = &mut app.detail else { return };
+    let Some(detail) = &mut app.detail else {
+        return;
+    };
     let block = pane_block(&detail.title, focused);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -692,7 +781,13 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         StatusKind::Err => theme::ERROR,
     };
     // The `:` command line takes over the status bar while it is open.
-    if let Some(cmd) = app.editor.vim.cmdline.as_ref().filter(|_| app.focus == Pane::Editor) {
+    if let Some(cmd) = app
+        .editor
+        .vim
+        .cmdline
+        .as_ref()
+        .filter(|_| app.focus == Pane::Editor)
+    {
         let text = format!(" :{cmd}");
         let cursor_x = area.x + text.width() as u16;
         f.render_widget(
@@ -700,7 +795,10 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
                 .style(Style::new().bg(theme::BG)),
             area,
         );
-        f.set_cursor_position(Position::new(cursor_x.min(area.x + area.width.saturating_sub(1)), area.y));
+        f.set_cursor_position(Position::new(
+            cursor_x.min(area.x + area.width.saturating_sub(1)),
+            area.y,
+        ));
         return;
     }
     let (left, left_color, right) = if app.resize_mode {
@@ -727,13 +825,11 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             (left, color, format!("{hints} "))
         } else {
             let hints = match app.focus {
-                Pane::Editor if app.cfg.qb.vim_mode && app.editor.mode != Mode::Insert => {
+                Pane::Editor if app.cfg.quim.vim_mode && app.editor.mode != Mode::Insert => {
                     "i insert · v visual · u/U undo/redo · ^R/:w run"
                 }
                 Pane::Editor => "^R run · ^E/F2 $EDITOR · ^N complete",
-                Pane::Results
-                    if app.view.as_ref().is_some_and(|v| v.vsel.is_some()) =>
-                {
+                Pane::Results if app.view.as_ref().is_some_and(|v| v.vsel.is_some()) => {
                     "y JSON · Y markdown · j/k extend · Esc cancel"
                 }
                 Pane::Results => "Enter detail · V rows · y/Y yank · r rerun · ? help",
@@ -776,7 +872,10 @@ fn draw_settings(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(theme::ACCENT_DIM))
-        .title(Span::styled(" Settings ", Style::new().fg(theme::ACCENT).bold()));
+        .title(Span::styled(
+            " Settings ",
+            Style::new().fg(theme::ACCENT).bold(),
+        ));
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width < 36 || inner.height < 5 {
@@ -792,8 +891,14 @@ fn draw_settings(f: &mut Frame, app: &mut App, area: Rect) {
     // Section list on the left.
     let sections = [
         (SettingsSection::General, "General".to_string()),
-        (SettingsSection::Servers, format!("Servers ({})", app.cfg.servers.len())),
-        (SettingsSection::Databases, format!("Databases ({})", app.cfg.databases.len())),
+        (
+            SettingsSection::Servers,
+            format!("Servers ({})", app.cfg.servers.len()),
+        ),
+        (
+            SettingsSection::Databases,
+            format!("Databases ({})", app.cfg.databases.len()),
+        ),
     ];
     let mut nav: Vec<Line> = vec![Line::raw("")];
     for (s, label) in &sections {
@@ -807,7 +912,10 @@ fn draw_settings(f: &mut Frame, app: &mut App, area: Rect) {
             (true, true) => Style::new().fg(theme::ACCENT),
             _ => Style::new().fg(theme::TEXT),
         };
-        nav.push(Line::styled(pad(&format!(" {marker}{label}"), nav_a.width as usize), style));
+        nav.push(Line::styled(
+            pad(&format!(" {marker}{label}"), nav_a.width as usize),
+            style,
+        ));
     }
     f.render_widget(Paragraph::new(nav), nav_a);
 
@@ -818,7 +926,10 @@ fn draw_settings(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Content on the right.
     let width = content_a.width as usize;
-    let sel_style = Style::new().fg(theme::TEXT).bg(theme::PANEL2).add_modifier(Modifier::BOLD);
+    let sel_style = Style::new()
+        .fg(theme::TEXT)
+        .bg(theme::PANEL2)
+        .add_modifier(Modifier::BOLD);
     let row_style = |i: usize| {
         if in_content && i == sel_row {
             sel_style
@@ -829,13 +940,20 @@ fn draw_settings(f: &mut Frame, app: &mut App, area: Rect) {
     let mut lines: Vec<Line> = vec![Line::raw("")];
     match section {
         SettingsSection::General => {
-            let vim_on = app.cfg.qb.vim_mode;
+            let vim_on = app.cfg.quim.vim_mode;
             let rows = [
                 (
-                    format!("Vim mode            [{}] {}", if vim_on { "x" } else { " " }, if vim_on { "on" } else { "off" }),
+                    format!(
+                        "Vim mode            [{}] {}",
+                        if vim_on { "x" } else { " " },
+                        if vim_on { "on" } else { "off" }
+                    ),
                     "modal editing in the query pane",
                 ),
-                ("Reset pane layout".to_string(), "clear the sizes saved with Ctrl+W"),
+                (
+                    "Reset pane layout".to_string(),
+                    "clear the sizes saved with Ctrl+W",
+                ),
             ];
             for (i, (label, hint)) in rows.iter().enumerate() {
                 lines.push(Line::from(vec![
@@ -853,11 +971,15 @@ fn draw_settings(f: &mut Frame, app: &mut App, area: Rect) {
             let name_w = 20usize;
             let host_w = width.saturating_sub(name_w + 6).clamp(10, 30);
             lines.push(Line::styled(
-                format!("  {}{}DATABASES", pad("NAME", name_w + 2), pad("HOST", host_w + 2)),
+                format!(
+                    "  {}{}DATABASES",
+                    pad("NAME", name_w + 2),
+                    pad("ENGINE / HOST", host_w + 2)
+                ),
                 Style::new().fg(theme::MUTED).add_modifier(Modifier::BOLD),
             ));
             for (i, s) in app.cfg.servers.iter().enumerate() {
-                let host = crate::config::server_of(&s.connection_string).unwrap_or_default();
+                let host = source_location(&s.engine, &s.connection_string);
                 let summary = match &s.databases {
                     crate::config::DbSelection::All(_) => "all".to_string(),
                     crate::config::DbSelection::Named(v) => format!("{} selected", v.len()),
@@ -872,19 +994,27 @@ fn draw_settings(f: &mut Frame, app: &mut App, area: Rect) {
                 ));
             }
             if app.cfg.servers.is_empty() {
-                lines.push(Line::styled("  (none — a adds one)", Style::new().fg(theme::FAINT)));
+                lines.push(Line::styled(
+                    "  (none — a adds one)",
+                    Style::new().fg(theme::FAINT),
+                ));
             }
         }
         SettingsSection::Databases => {
             let name_w = 20usize;
             let host_w = width.saturating_sub(name_w + 6).clamp(10, 30);
             lines.push(Line::styled(
-                format!("  {}{}DATABASE", pad("NAME", name_w + 2), pad("HOST", host_w + 2)),
+                format!(
+                    "  {}{}DATABASE",
+                    pad("NAME", name_w + 2),
+                    pad("ENGINE / HOST", host_w + 2)
+                ),
                 Style::new().fg(theme::MUTED).add_modifier(Modifier::BOLD),
             ));
             for (i, d) in app.cfg.databases.iter().enumerate() {
-                let host = crate::config::server_of(&d.connection_string).unwrap_or_default();
-                let db = crate::config::database_of(&d.connection_string).unwrap_or_default();
+                let host = source_location(&d.engine, &d.connection_string);
+                let db = crate::config::database_of_engine(&d.engine, &d.connection_string)
+                    .unwrap_or_default();
                 lines.push(Line::styled(
                     format!(
                         "  {}{}{db}",
@@ -895,7 +1025,10 @@ fn draw_settings(f: &mut Frame, app: &mut App, area: Rect) {
                 ));
             }
             if app.cfg.databases.is_empty() {
-                lines.push(Line::styled("  (none — a adds one)", Style::new().fg(theme::FAINT)));
+                lines.push(Line::styled(
+                    "  (none — a adds one)",
+                    Style::new().fg(theme::FAINT),
+                ));
             }
         }
     }
@@ -904,10 +1037,48 @@ fn draw_settings(f: &mut Frame, app: &mut App, area: Rect) {
 
 // --- Source form -----------------------------------------------------------------
 
+fn source_location(engine: &str, connection_string: &str) -> String {
+    let engine = config::normalize_engine(engine);
+    let location = match engine.as_str() {
+        "mssql" => crate::config::server_of(connection_string).unwrap_or_default(),
+        "postgres" => postgres_host_of(connection_string).unwrap_or_default(),
+        "sqlite" => connection_string.trim().to_string(),
+        _ => String::new(),
+    };
+    if location.is_empty() {
+        engine
+    } else {
+        format!("{engine}: {location}")
+    }
+}
+
+fn postgres_host_of(connection_string: &str) -> Option<String> {
+    let raw = connection_string.trim();
+    if !(raw.starts_with("postgres://") || raw.starts_with("postgresql://")) {
+        return None;
+    }
+    let rest = raw.split_once("://").map(|(_, rest)| rest)?;
+    let authority = rest.split(['/', '?']).next().unwrap_or("");
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    if host_port.is_empty() {
+        None
+    } else {
+        Some(host_port.to_string())
+    }
+}
+
 fn centered(area: Rect, w: u16, h: u16) -> Rect {
     let w = w.min(area.width.saturating_sub(2));
     let h = h.min(area.height.saturating_sub(2));
-    Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h)
+    Rect::new(
+        area.x + (area.width - w) / 2,
+        area.y + (area.height - h) / 2,
+        w,
+        h,
+    )
 }
 
 fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
@@ -917,12 +1088,18 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(theme::ERROR))
-        .title(Span::styled(" Delete ", Style::new().fg(theme::ERROR).bold()));
+        .title(Span::styled(
+            " Delete ",
+            Style::new().fg(theme::ERROR).bold(),
+        ));
     let inner = block.inner(rect);
     f.render_widget(Clear, rect);
     f.render_widget(block.style(Style::new().bg(theme::PANEL2)), rect);
     f.render_widget(
-        Paragraph::new(Line::styled(format!(" {msg}"), Style::new().fg(theme::TEXT))),
+        Paragraph::new(Line::styled(
+            format!(" {msg}"),
+            Style::new().fg(theme::TEXT),
+        )),
         inner,
     );
 }
@@ -930,14 +1107,17 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
 fn draw_form(f: &mut Frame, app: &mut App, area: Rect) {
     let tick = app.tick;
     let Some(form) = &app.form else { return };
-    let list_h = if form.kind == SourceKind::Server && !form.all_dbs && !form.db_list.is_empty() {
+    let server_form =
+        form.kind == SourceKind::Server && config::supports_server_sources(&form.engine);
+    let list_h = if server_form && !form.all_dbs && !form.db_list.is_empty() {
         form.db_list.len().min(8) as u16
     } else {
         0
     };
     let base: u16 = 2 // name + conn
         + if form.editing_id.is_none() { 1 } else { 0 } // type
-        + if form.kind == SourceKind::Server { 2 } else { 0 } // fetch + all
+        + 1 // engine
+        + if server_form { 2 } else { 0 } // fetch + all
         + list_h
         + if form.error.is_some() { 2 } else { 1 } // spacing + error
         + 1; // buttons
@@ -981,9 +1161,29 @@ fn draw_form(f: &mut Frame, app: &mut App, area: Rect) {
                 format!(" {val} "),
                 if focused { sel_style } else { value_style },
             ),
-            Span::styled("  (server = one connection, many databases)", Style::new().fg(theme::FAINT)),
+            Span::styled(
+                "  (server = one connection, many databases)",
+                Style::new().fg(theme::FAINT),
+            ),
         ]));
     }
+
+    let focused = form.focus == FormField::Engine;
+    let engine = config::normalize_engine(&form.engine);
+    let engine_hint = match engine.as_str() {
+        "mssql" => "ADO.NET: Server=...;Database=...",
+        "postgres" => "URL: postgres://user:pass@host:5432/db",
+        "sqlite" => "file path or sqlite: URL",
+        _ => "unsupported",
+    };
+    lines.push(Line::from(vec![
+        Span::styled(pad(" Engine", label_w), label_style),
+        Span::styled(
+            format!(" ‹ {} › ", engine),
+            if focused { sel_style } else { value_style },
+        ),
+        Span::styled(format!("  ({engine_hint})"), Style::new().fg(theme::FAINT)),
+    ]));
 
     for (field, label, text) in [
         (FormField::Name, " Name", &form.name),
@@ -998,7 +1198,11 @@ fn draw_form(f: &mut Frame, app: &mut App, area: Rect) {
             (0, 0)
         };
         let shown: String = text.chars().skip(start).take(field_w).collect();
-        let shown = if !focused && chars > field_w { fit(text, field_w) } else { shown };
+        let shown = if !focused && chars > field_w {
+            fit(text, field_w)
+        } else {
+            shown
+        };
         let style = if focused {
             Style::new().fg(theme::TEXT).bg(theme::BG)
         } else {
@@ -1014,7 +1218,7 @@ fn draw_form(f: &mut Frame, app: &mut App, area: Rect) {
         ]));
     }
 
-    if form.kind == SourceKind::Server {
+    if server_form {
         let focused = form.focus == FormField::Fetch;
         let fetch_label = if form.fetching {
             format!(" {} Fetching… ", spinner(tick))
@@ -1024,7 +1228,14 @@ fn draw_form(f: &mut Frame, app: &mut App, area: Rect) {
         lines.push(Line::from(vec![
             Span::styled(pad("", label_w + 1), label_style),
             Span::styled("[", Style::new().fg(theme::FAINT)),
-            Span::styled(fetch_label, if focused { sel_style } else { Style::new().fg(theme::ACCENT_DIM) }),
+            Span::styled(
+                fetch_label,
+                if focused {
+                    sel_style
+                } else {
+                    Style::new().fg(theme::ACCENT_DIM)
+                },
+            ),
             Span::styled("]", Style::new().fg(theme::FAINT)),
         ]));
 
@@ -1037,7 +1248,11 @@ fn draw_form(f: &mut Frame, app: &mut App, area: Rect) {
                 if focused { sel_style } else { value_style },
             ),
             Span::styled(
-                if form.all_dbs { "(every database on the server)" } else { "(pick from the list below)" },
+                if form.all_dbs {
+                    "(every database on the server)"
+                } else {
+                    "(pick from the list below)"
+                },
                 Style::new().fg(theme::FAINT),
             ),
         ]));
@@ -1088,9 +1303,23 @@ fn draw_form(f: &mut Frame, app: &mut App, area: Rect) {
     lines.push(Line::from(vec![
         Span::styled(pad("", label_w + 1), label_style),
         Span::styled("[", Style::new().fg(theme::FAINT)),
-        Span::styled(save_label, if save_focused { sel_style } else { Style::new().fg(theme::ACCENT) }),
+        Span::styled(
+            save_label,
+            if save_focused {
+                sel_style
+            } else {
+                Style::new().fg(theme::ACCENT)
+            },
+        ),
         Span::styled("]   [", Style::new().fg(theme::FAINT)),
-        Span::styled(" Cancel ", if cancel_focused { sel_style } else { value_style }),
+        Span::styled(
+            " Cancel ",
+            if cancel_focused {
+                sel_style
+            } else {
+                value_style
+            },
+        ),
         Span::styled("]", Style::new().fg(theme::FAINT)),
     ]));
 
@@ -1102,13 +1331,22 @@ fn draw_form(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_help(f: &mut Frame, area: Rect) {
     let entries: &[(&str, &str)] = &[
-        ("Ctrl+H/J/K/L", "switch pane (also Ctrl+arrows, Alt+HJKL); at edge: tmux"),
-        ("Ctrl+R / F5 / Ctrl+Enter", "run query (also :w in vim normal mode)"),
+        (
+            "Ctrl+H/J/K/L",
+            "switch pane (also Ctrl+arrows, Alt+HJKL); at edge: tmux",
+        ),
+        (
+            "Ctrl+R / F5 / Ctrl+Enter",
+            "run query (also :w in vim normal mode)",
+        ),
         ("Ctrl+W, then h/j/k/l", "resize pane (saved to config)"),
         ("", ""),
         ("j/k, gg/G, Ctrl+D/U", "navigate lists & results"),
         ("/", "filter databases/tables"),
-        (",", "settings: vim mode, servers & databases (not in editor)"),
+        (
+            ",",
+            "settings: vim mode, servers & databases (not in editor)",
+        ),
         ("a / e / d", "add / edit / delete source (database list)"),
         ("Enter", "select database / preview table / open cell"),
         ("h/l, w/b, 0/$", "move between result columns"),
@@ -1116,11 +1354,20 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("y / Y", "copy cell / row (TSV)"),
         ("r", "run the last query again"),
         ("", ""),
-        ("vim mode", "i/a/o insert · v/V visual · d/c/y+motion · u/U undo/redo"),
-        ("", "w/b/e f/t gg/G 0/^/$ motions · p/P paste · :w runs the query"),
+        (
+            "vim mode",
+            "i/a/o insert · v/V visual · d/c/y+motion · u/U undo/redo",
+        ),
+        (
+            "",
+            "w/b/e f/t gg/G 0/^/$ motions · p/P paste · :w runs the query",
+        ),
         ("", "toggle in , settings"),
         ("Ctrl+E / F2", "open the query in $EDITOR"),
-        ("Ctrl+N/P, Tab", "autocomplete: cycle / accept (insert mode)"),
+        (
+            "Ctrl+N/P, Tab",
+            "autocomplete: cycle / accept (insert mode)",
+        ),
         ("Ctrl+Backspace/Delete", "delete word (insert mode)"),
         ("Esc", "normal mode · close detail · clear filter"),
         ("", ""),
@@ -1129,11 +1376,19 @@ fn draw_help(f: &mut Frame, area: Rect) {
     ];
     let w = 68.min(area.width.saturating_sub(4));
     let h = (entries.len() as u16 + 2).min(area.height.saturating_sub(2));
-    let rect = Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h);
+    let rect = Rect::new(
+        area.x + (area.width - w) / 2,
+        area.y + (area.height - h) / 2,
+        w,
+        h,
+    );
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(theme::ACCENT_DIM))
-        .title(Span::styled(" Keys ", Style::new().fg(theme::ACCENT).bold()));
+        .title(Span::styled(
+            " Keys ",
+            Style::new().fg(theme::ACCENT).bold(),
+        ));
     let inner = block.inner(rect);
     f.render_widget(Clear, rect);
     f.render_widget(block.style(Style::new().bg(theme::PANEL2)), rect);

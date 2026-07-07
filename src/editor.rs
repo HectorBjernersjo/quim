@@ -93,7 +93,11 @@ impl Editor {
     }
 
     pub fn set_text(&mut self, text: &str) {
-        self.lines = text.replace("\r\n", "\n").split('\n').map(str::to_string).collect();
+        self.lines = text
+            .replace("\r\n", "\n")
+            .split('\n')
+            .map(str::to_string)
+            .collect();
         if self.lines.is_empty() {
             self.lines.push(String::new());
         }
@@ -140,11 +144,18 @@ impl Editor {
 
     /// One step right within the line (normal-mode l).
     pub fn norm_right(&mut self) -> (usize, usize) {
-        (self.row, (self.col + 1).min(self.line_len(self.row).saturating_sub(1)))
+        (
+            self.row,
+            (self.col + 1).min(self.line_len(self.row).saturating_sub(1)),
+        )
     }
 
     pub fn push_undo(&mut self) {
-        self.undo_stack.push(Snapshot { lines: self.lines.clone(), row: self.row, col: self.col });
+        self.undo_stack.push(Snapshot {
+            lines: self.lines.clone(),
+            row: self.row,
+            col: self.col,
+        });
         if self.undo_stack.len() > MAX_UNDO {
             self.undo_stack.remove(0);
         }
@@ -153,7 +164,11 @@ impl Editor {
 
     pub fn undo(&mut self) {
         if let Some(snap) = self.undo_stack.pop() {
-            self.redo_stack.push(Snapshot { lines: self.lines.clone(), row: self.row, col: self.col });
+            self.redo_stack.push(Snapshot {
+                lines: self.lines.clone(),
+                row: self.row,
+                col: self.col,
+            });
             self.lines = snap.lines;
             self.row = snap.row.min(self.lines.len() - 1);
             self.col = snap.col;
@@ -164,7 +179,11 @@ impl Editor {
 
     pub fn redo(&mut self) {
         if let Some(snap) = self.redo_stack.pop() {
-            self.undo_stack.push(Snapshot { lines: self.lines.clone(), row: self.row, col: self.col });
+            self.undo_stack.push(Snapshot {
+                lines: self.lines.clone(),
+                row: self.row,
+                col: self.col,
+            });
             self.lines = snap.lines;
             self.row = snap.row.min(self.lines.len() - 1);
             self.col = snap.col;
@@ -203,7 +222,10 @@ impl Editor {
         let idx = self.byte_idx(self.row, self.col);
         let rest = self.lines[self.row].split_off(idx);
         let indent = if auto_indent {
-            self.lines[self.row].chars().take_while(|c| *c == ' ' || *c == '\t').collect()
+            self.lines[self.row]
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect()
         } else {
             String::new()
         };
@@ -328,7 +350,10 @@ impl Editor {
 
     pub fn home(&mut self) {
         // Smart home: first non-blank, then column 0.
-        let first = self.lines[self.row].chars().take_while(|c| c.is_whitespace()).count();
+        let first = self.lines[self.row]
+            .chars()
+            .take_while(|c| c.is_whitespace())
+            .count();
         self.col = if self.col == first { 0 } else { first };
         self.completion = None;
     }
@@ -398,7 +423,8 @@ impl Editor {
         let mut qual = None;
         if start > 0 && chars[start - 1] == '.' {
             let mut qs = start - 1;
-            while qs > 0 && (is_word(chars[qs - 1]) || chars[qs - 1] == ']' || chars[qs - 1] == '[') {
+            while qs > 0 && (is_word(chars[qs - 1]) || chars[qs - 1] == ']' || chars[qs - 1] == '[')
+            {
                 qs -= 1;
             }
             let q: String = chars[qs..start - 1]
@@ -427,7 +453,11 @@ impl Editor {
         self.completion = if items.is_empty() {
             None
         } else {
-            Some(Completion { items, sel: 0, partial_len: partial.chars().count() })
+            Some(Completion {
+                items,
+                sel: 0,
+                partial_len: partial.chars().count(),
+            })
         };
     }
 
@@ -466,7 +496,11 @@ impl Editor {
             for t in &self.tables {
                 if matches(&t.name) {
                     let label = format!("{}.{}", t.schema, t.name);
-                    items.push(CompItem { insert: t.name.clone(), label, kind: CompKind::Table });
+                    items.push(CompItem {
+                        insert: t.name.clone(),
+                        label,
+                        kind: CompKind::Table,
+                    });
                 }
             }
             let mut schemas: Vec<&str> = self.tables.iter().map(|t| t.schema.as_str()).collect();
@@ -531,13 +565,10 @@ impl Editor {
         }
         for (alias, table) in self.aliases() {
             if alias == q {
-                return self
-                    .tables
-                    .iter()
-                    .find(|t| {
-                        t.name.to_lowercase() == table
-                            || format!("{}.{}", t.schema, t.name).to_lowercase() == table
-                    });
+                return self.tables.iter().find(|t| {
+                    t.name.to_lowercase() == table
+                        || format!("{}.{}", t.schema, t.name).to_lowercase() == table
+                });
             }
         }
         None
@@ -592,8 +623,12 @@ impl Editor {
     }
 
     pub fn accept_completion(&mut self) -> bool {
-        let Some(c) = self.completion.take() else { return false };
-        let Some(item) = c.items.get(c.sel) else { return false };
+        let Some(c) = self.completion.take() else {
+            return false;
+        };
+        let Some(item) = c.items.get(c.sel) else {
+            return false;
+        };
         let start = self.col - c.partial_len;
         let b_start = self.byte_idx(self.row, start);
         let b_end = self.byte_idx(self.row, self.col);

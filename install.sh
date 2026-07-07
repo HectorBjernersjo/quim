@@ -1,18 +1,18 @@
 #!/usr/bin/env sh
-# qb installer
+# quim installer
 #
 # Usage:
-#   curl -fsSL https://github.com/HectorBjernersjo/querybench/releases/latest/download/install.sh | sh
+#   curl -fsSL https://github.com/HectorBjernersjo/quim/releases/latest/download/install.sh | sh
 #
 # Env vars:
-#   QB_VERSION     Pin a specific tag (e.g. v0.1.0). Defaults to "latest".
-#   QB_INSTALL_DIR Where to drop the binary. Defaults to $HOME/.local/bin.
+#   QUIM_VERSION     Pin a specific tag (e.g. v0.1.0). Defaults to "latest".
+#   QUIM_INSTALL_DIR Where to drop the binary. Defaults to $HOME/.local/bin.
 
 set -eu
 
-REPO="HectorBjernersjo/querybench"
-VERSION="${QB_VERSION:-latest}"
-INSTALL_DIR="${QB_INSTALL_DIR:-$HOME/.local/bin}"
+REPO="HectorBjernersjo/quim"
+VERSION="${QUIM_VERSION:-latest}"
+INSTALL_DIR="${QUIM_INSTALL_DIR:-$HOME/.local/bin}"
 
 uname_s="$(uname -s)"
 uname_m="$(uname -m)"
@@ -30,7 +30,7 @@ case "$uname_m" in
 esac
 
 target="${arch}-${os}"
-asset="qb-${target}.tar.gz"
+asset="quim-${target}.tar.gz"
 
 if [ "$VERSION" = "latest" ]; then
     url="https://github.com/${REPO}/releases/latest/download/${asset}"
@@ -38,25 +38,25 @@ else
     url="https://github.com/${REPO}/releases/download/${VERSION}/${asset}"
 fi
 
-echo "Installing qb (${VERSION}) for ${target} to ${INSTALL_DIR}"
+echo "Installing quim (${VERSION}) for ${target} to ${INSTALL_DIR}"
 
 mkdir -p "$INSTALL_DIR"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-curl -fsSL "$url" -o "$tmp/qb.tar.gz"
-tar -xzf "$tmp/qb.tar.gz" -C "$tmp"
-mv "$tmp/qb" "$INSTALL_DIR/qb"
-chmod +x "$INSTALL_DIR/qb"
+curl -fsSL "$url" -o "$tmp/quim.tar.gz"
+tar -xzf "$tmp/quim.tar.gz" -C "$tmp"
+mv "$tmp/quim" "$INSTALL_DIR/quim"
+chmod +x "$INSTALL_DIR/quim"
 
-echo "Installed: $INSTALL_DIR/qb"
+echo "Installed: $INSTALL_DIR/quim"
 
 echo ""
 echo "Get started:"
 echo ""
-echo "  qb           # launch the TUI (press 'a' to add a database)"
-echo "  qb --check   # test config + connection + schema headlessly"
+echo "  quim           # launch the TUI (press 'a' to add a database)"
+echo "  quim --check   # test config + connection + schema headlessly"
 echo "  ?            # in the app: help / all keybindings"
 
 case ":$PATH:" in

@@ -33,9 +33,9 @@ type Tui = Terminal<CrosstermBackend<io::Stdout>>;
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("qb — TUI for SQL against MSSQL, shares config with querybench");
-        println!("\n  qb            start the TUI");
-        println!("  qb --check    test config, connection, schema and SELECT 1 without the TUI");
+        println!("quim — TUI for SQL against MSSQL, Postgres and SQLite");
+        println!("\n  quim            start the TUI");
+        println!("  quim --check    test config, connection, schema and SELECT 1 without the TUI");
         println!("\nConfig: {}", config::config_path().display());
         return Ok(());
     }
@@ -45,10 +45,10 @@ fn main() -> io::Result<()> {
 
     // vim-tmux-navigator only passes C-hjkl through to processes whose comm
     // matches its vim pattern; the pattern allows any "<prefix>/" before the
-    // name, so "qb/view" matches stock configs while staying recognizable in
-    // process lists. qb hands the keys back to tmux at pane edges.
+    // name, so "quim/view" matches stock configs while staying recognizable in
+    // process lists. quim hands the keys back to tmux at pane edges.
     #[cfg(target_os = "linux")]
-    let _ = std::fs::write("/proc/self/comm", "qb/view");
+    let _ = std::fs::write("/proc/self/comm", "quim/view");
 
     let cfg = match config::load() {
         Ok(c) => c,
@@ -75,7 +75,7 @@ fn main() -> io::Result<()> {
                 app.on_db_response(resp);
             }
             terminal.draw(|f| ui::draw(f, &mut app))?;
-            let want = if app.focus == app::Pane::Editor && app.cfg.qb.vim_mode {
+            let want = if app.focus == app::Pane::Editor && app.cfg.quim.vim_mode {
                 match app.editor.mode {
                     editor::Mode::Insert => 1,
                     _ => 2,
@@ -146,7 +146,7 @@ fn restore_terminal() -> io::Result<()> {
 
 /// Suspend the TUI, open the query in $EDITOR (like lazygit), read it back.
 fn external_edit(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
-    let path = std::env::temp_dir().join("qb_query.sql");
+    let path = std::env::temp_dir().join("quim_query.sql");
     std::fs::write(&path, app.editor.text())?;
 
     restore_terminal()?;
@@ -169,7 +169,10 @@ fn external_edit(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
             }
         }
         Ok(_) => app.set_status("Editor aborted — query kept".into(), app::StatusKind::Info),
-        Err(e) => app.set_status(format!("✕ Could not launch $EDITOR: {e}"), app::StatusKind::Err),
+        Err(e) => app.set_status(
+            format!("✕ Could not launch $EDITOR: {e}"),
+            app::StatusKind::Err,
+        ),
     }
     Ok(())
 }
@@ -184,9 +187,13 @@ fn check() -> io::Result<()> {
         }
     };
     println!("config: {}", config::config_path().display());
-    println!("{} server(s), {} standalone database(s)", cfg.servers.len(), cfg.databases.len());
+    println!(
+        "{} server(s), {} standalone database(s)",
+        cfg.servers.len(),
+        cfg.databases.len()
+    );
     if cfg.servers.is_empty() && cfg.databases.is_empty() {
-        println!("No sources — add one in qb (press a) or querybench.");
+        println!("No sources — add one in quim (press a).");
         return Ok(());
     }
 
@@ -208,7 +215,11 @@ fn check() -> io::Result<()> {
     }
     println!(
         "databases: {}",
-        app.dbs.iter().map(|d| d.label.clone()).collect::<Vec<_>>().join(", ")
+        app.dbs
+            .iter()
+            .map(|d| d.label.clone())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
 
     let Some(first) = app.dbs.first().cloned() else {
@@ -234,10 +245,10 @@ fn check() -> io::Result<()> {
     print!("test query … ");
     io::stdout().flush()?;
     let _ = req_tx.send(db::DbRequest::Query {
+        engine: first.engine.clone(),
         conn: first.conn.clone(),
         database: first.database.clone(),
-        sql: "SELECT 1 AS one, N'åäö' AS text, NEWID() AS id, GETDATE() AS now, NULL AS nothing"
-            .into(),
+        sql: "SELECT 1 AS one, 'text' AS text, NULL AS nothing".into(),
     });
     loop {
         match recv("query") {

@@ -6,24 +6,157 @@ use ratatui::style::Color;
 pub type SpanLine = Vec<(String, Color)>;
 
 const KEYWORDS: &[&str] = &[
-    "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "FROM", "WHERE", "JOIN", "INNER", "LEFT",
-    "RIGHT", "FULL", "OUTER", "CROSS", "APPLY", "ON", "GROUP", "BY", "ORDER", "HAVING", "TOP",
-    "DISTINCT", "AS", "AND", "OR", "NOT", "NULL", "IS", "IN", "EXISTS", "BETWEEN", "LIKE",
-    "CASE", "WHEN", "THEN", "ELSE", "END", "UNION", "ALL", "VALUES", "INTO", "SET", "CREATE",
-    "ALTER", "DROP", "TRUNCATE", "TABLE", "VIEW", "INDEX", "PROCEDURE", "PROC", "FUNCTION",
-    "TRIGGER", "DECLARE", "BEGIN", "COMMIT", "ROLLBACK", "TRAN", "TRANSACTION", "WITH", "OVER",
-    "PARTITION", "OFFSET", "FETCH", "NEXT", "ROWS", "ONLY", "ASC", "DESC", "EXEC", "EXECUTE",
-    "PRINT", "IF", "WHILE", "RETURN", "GO", "USE", "PIVOT", "UNPIVOT", "OUTPUT", "DEFAULT",
-    "PRIMARY", "FOREIGN", "KEY", "REFERENCES", "CONSTRAINT", "IDENTITY", "ADD", "COLUMN",
+    "SELECT",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "MERGE",
+    "FROM",
+    "WHERE",
+    "JOIN",
+    "INNER",
+    "LEFT",
+    "RIGHT",
+    "FULL",
+    "OUTER",
+    "CROSS",
+    "APPLY",
+    "ON",
+    "GROUP",
+    "BY",
+    "ORDER",
+    "HAVING",
+    "TOP",
+    "DISTINCT",
+    "AS",
+    "AND",
+    "OR",
+    "NOT",
+    "NULL",
+    "IS",
+    "IN",
+    "EXISTS",
+    "BETWEEN",
+    "LIKE",
+    "CASE",
+    "WHEN",
+    "THEN",
+    "ELSE",
+    "END",
+    "UNION",
+    "ALL",
+    "VALUES",
+    "INTO",
+    "SET",
+    "CREATE",
+    "ALTER",
+    "DROP",
+    "TRUNCATE",
+    "TABLE",
+    "VIEW",
+    "INDEX",
+    "PROCEDURE",
+    "PROC",
+    "FUNCTION",
+    "TRIGGER",
+    "DECLARE",
+    "BEGIN",
+    "COMMIT",
+    "ROLLBACK",
+    "TRAN",
+    "TRANSACTION",
+    "WITH",
+    "OVER",
+    "PARTITION",
+    "OFFSET",
+    "FETCH",
+    "NEXT",
+    "ROWS",
+    "ONLY",
+    "ASC",
+    "DESC",
+    "EXEC",
+    "EXECUTE",
+    "PRINT",
+    "IF",
+    "WHILE",
+    "RETURN",
+    "GO",
+    "USE",
+    "PIVOT",
+    "UNPIVOT",
+    "OUTPUT",
+    "DEFAULT",
+    "PRIMARY",
+    "FOREIGN",
+    "KEY",
+    "REFERENCES",
+    "CONSTRAINT",
+    "IDENTITY",
+    "ADD",
+    "COLUMN",
+    "LIMIT",
+    "RETURNING",
+    "UPSERT",
+    "CONFLICT",
 ];
 
 const FUNCTIONS: &[&str] = &[
-    "COUNT", "SUM", "AVG", "MIN", "MAX", "CAST", "CONVERT", "COALESCE", "ISNULL", "NULLIF",
-    "GETDATE", "GETUTCDATE", "SYSDATETIME", "NEWID", "ROW_NUMBER", "RANK", "DENSE_RANK",
-    "LEN", "DATALENGTH", "SUBSTRING", "REPLACE", "UPPER", "LOWER", "LTRIM", "RTRIM", "TRIM",
-    "CONCAT", "FORMAT", "DATEADD", "DATEDIFF", "DATEPART", "YEAR", "MONTH", "DAY", "IIF",
-    "TRY_CAST", "TRY_CONVERT", "STRING_AGG", "STUFF", "CHARINDEX", "ABS", "ROUND", "FLOOR",
-    "CEILING", "JSON_VALUE", "JSON_QUERY", "OPENJSON", "OBJECT_ID", "SCOPE_IDENTITY",
+    "COUNT",
+    "SUM",
+    "AVG",
+    "MIN",
+    "MAX",
+    "CAST",
+    "CONVERT",
+    "COALESCE",
+    "ISNULL",
+    "NULLIF",
+    "GETDATE",
+    "GETUTCDATE",
+    "SYSDATETIME",
+    "NEWID",
+    "ROW_NUMBER",
+    "RANK",
+    "DENSE_RANK",
+    "LEN",
+    "DATALENGTH",
+    "SUBSTRING",
+    "REPLACE",
+    "UPPER",
+    "LOWER",
+    "LTRIM",
+    "RTRIM",
+    "TRIM",
+    "CONCAT",
+    "FORMAT",
+    "DATEADD",
+    "DATEDIFF",
+    "DATEPART",
+    "YEAR",
+    "MONTH",
+    "DAY",
+    "IIF",
+    "TRY_CAST",
+    "TRY_CONVERT",
+    "STRING_AGG",
+    "STUFF",
+    "CHARINDEX",
+    "ABS",
+    "ROUND",
+    "FLOOR",
+    "CEILING",
+    "JSON_VALUE",
+    "JSON_QUERY",
+    "OPENJSON",
+    "OBJECT_ID",
+    "SCOPE_IDENTITY",
+    "NOW",
+    "CURRENT_DATE",
+    "CURRENT_TIME",
+    "CURRENT_TIMESTAMP",
+    "RANDOM",
+    "UUID_GENERATE_V4",
 ];
 
 pub fn is_keyword(word: &str) -> bool {
@@ -41,7 +174,9 @@ struct Emitter {
 
 impl Emitter {
     fn new() -> Self {
-        Emitter { lines: vec![vec![]] }
+        Emitter {
+            lines: vec![vec![]],
+        }
     }
 
     fn emit(&mut self, text: &str, color: Color) {
@@ -85,7 +220,10 @@ pub fn highlight_sql(text: &str) -> Vec<SpanLine> {
             while i < n && chars[i] != '\n' {
                 i += 1;
             }
-            em.emit(&chars[start..i].iter().collect::<String>(), theme::SQL_COMMENT);
+            em.emit(
+                &chars[start..i].iter().collect::<String>(),
+                theme::SQL_COMMENT,
+            );
             continue;
         }
         // Block comment
@@ -96,7 +234,10 @@ pub fn highlight_sql(text: &str) -> Vec<SpanLine> {
                 i += 1;
             }
             i = (i + 2).min(n);
-            em.emit(&chars[start..i].iter().collect::<String>(), theme::SQL_COMMENT);
+            em.emit(
+                &chars[start..i].iter().collect::<String>(),
+                theme::SQL_COMMENT,
+            );
             continue;
         }
         // String literal (with '' escape). N'...' handled via ident path fallthrough.
@@ -114,7 +255,10 @@ pub fn highlight_sql(text: &str) -> Vec<SpanLine> {
                 }
                 i += 1;
             }
-            em.emit(&chars[start..i].iter().collect::<String>(), theme::SQL_STRING);
+            em.emit(
+                &chars[start..i].iter().collect::<String>(),
+                theme::SQL_STRING,
+            );
             continue;
         }
         // Bracketed identifier
@@ -136,7 +280,10 @@ pub fn highlight_sql(text: &str) -> Vec<SpanLine> {
             while i < n && (chars[i].is_ascii_alphanumeric() || chars[i] == '.') {
                 i += 1;
             }
-            em.emit(&chars[start..i].iter().collect::<String>(), theme::SQL_NUMBER);
+            em.emit(
+                &chars[start..i].iter().collect::<String>(),
+                theme::SQL_NUMBER,
+            );
             continue;
         }
         // Word
@@ -146,7 +293,11 @@ pub fn highlight_sql(text: &str) -> Vec<SpanLine> {
                 i += 1;
             }
             let word: String = chars[start..i].iter().collect();
-            let color = if is_keyword(&word) { theme::SQL_KEYWORD } else { theme::TEXT };
+            let color = if is_keyword(&word) {
+                theme::SQL_KEYWORD
+            } else {
+                theme::TEXT
+            };
             em.emit(&word, color);
             continue;
         }
@@ -189,7 +340,11 @@ pub fn highlight_json(text: &str) -> Vec<SpanLine> {
             while j < n && (chars[j] == ' ' || chars[j] == '\t') {
                 j += 1;
             }
-            let color = if j < n && chars[j] == ':' { theme::J_PROP } else { theme::J_STRING };
+            let color = if j < n && chars[j] == ':' {
+                theme::J_PROP
+            } else {
+                theme::J_STRING
+            };
             em.emit(&chars[start..i].iter().collect::<String>(), color);
             continue;
         }
@@ -224,7 +379,7 @@ pub fn highlight_json(text: &str) -> Vec<SpanLine> {
     em.lines
 }
 
-/// Parse a cell value as JSON the same way querybench does: only if it looks
+/// Parse a cell value as JSON only if it looks
 /// like an object/array, and pretty-print on success.
 pub fn try_pretty_json(value: &str) -> Option<String> {
     let trimmed = value.trim();

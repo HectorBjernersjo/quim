@@ -150,7 +150,13 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) -> Outcome {
                 let count = take_count(ed).unwrap_or(1);
                 let end = (ed.col + count).min(ed.line_len(ed.row));
                 if end > ed.col {
-                    apply_op(ed, 'd', (ed.row, ed.col), (ed.row, end), RangeKind::Charwise);
+                    apply_op(
+                        ed,
+                        'd',
+                        (ed.row, ed.col),
+                        (ed.row, end),
+                        RangeKind::Charwise,
+                    );
                 }
             }
         }
@@ -158,7 +164,13 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) -> Outcome {
             let count = take_count(ed).unwrap_or(1);
             let start = ed.col.saturating_sub(count);
             if start < ed.col {
-                apply_op(ed, 'd', (ed.row, start), (ed.row, ed.col), RangeKind::Charwise);
+                apply_op(
+                    ed,
+                    'd',
+                    (ed.row, start),
+                    (ed.row, ed.col),
+                    RangeKind::Charwise,
+                );
             }
         }
         'D' => op_to_eol(ed, 'd'),
@@ -169,7 +181,13 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) -> Outcome {
         }
         's' => {
             let end = (ed.col + take_count(ed).unwrap_or(1)).min(ed.line_len(ed.row));
-            apply_op(ed, 'c', (ed.row, ed.col), (ed.row, end), RangeKind::Charwise);
+            apply_op(
+                ed,
+                'c',
+                (ed.row, ed.col),
+                (ed.row, end),
+                RangeKind::Charwise,
+            );
         }
         'S' => {
             let count = take_count(ed).unwrap_or(1);
@@ -363,7 +381,11 @@ fn finish_motion(ed: &mut Editor, start: (usize, usize), target: (usize, usize),
         ed.clamp_normal_col();
         return;
     };
-    let (a, b) = if (target.0, target.1) < (start.0, start.1) { (target, start) } else { (start, target) };
+    let (a, b) = if (target.0, target.1) < (start.0, start.1) {
+        (target, start)
+    } else {
+        (start, target)
+    };
     if a == b && kind == RangeKind::Charwise {
         return;
     }
@@ -373,7 +395,11 @@ fn finish_motion(ed: &mut Editor, start: (usize, usize), target: (usize, usize),
 /// gg/G with a pending operator act linewise; without one they just move.
 fn linewise_or_move(ed: &mut Editor, row: usize) {
     if let Some(op) = ed.vim.operator.take() {
-        let (a, b) = if row < ed.row { (row, ed.row) } else { (ed.row, row) };
+        let (a, b) = if row < ed.row {
+            (row, ed.row)
+        } else {
+            (ed.row, row)
+        };
         apply_op(ed, op, (a, 0), (b, 0), RangeKind::Linewise);
     } else {
         ed.row = row;
@@ -385,7 +411,11 @@ fn vertical(ed: &mut Editor, dir: isize) {
     let count = take_count(ed).unwrap_or(1) as isize;
     if let Some(op) = ed.vim.operator.take() {
         let target = (ed.row as isize + dir * count).clamp(0, ed.lines.len() as isize - 1) as usize;
-        let (a, b) = if target < ed.row { (target, ed.row) } else { (ed.row, target) };
+        let (a, b) = if target < ed.row {
+            (target, ed.row)
+        } else {
+            (ed.row, target)
+        };
         apply_op(ed, op, (a, 0), (b, 0), RangeKind::Linewise);
         return;
     }
@@ -397,7 +427,13 @@ fn vertical(ed: &mut Editor, dir: isize) {
 fn motion_dollar(ed: &mut Editor) {
     ed.vim.count.clear();
     if let Some(op) = ed.vim.operator.take() {
-        apply_op(ed, op, (ed.row, ed.col), (ed.row, ed.line_len(ed.row)), RangeKind::Charwise);
+        apply_op(
+            ed,
+            op,
+            (ed.row, ed.col),
+            (ed.row, ed.line_len(ed.row)),
+            RangeKind::Charwise,
+        );
         return;
     }
     ed.col = ed.line_len(ed.row).saturating_sub(1);
@@ -429,11 +465,20 @@ fn motion_e(ed: &mut Editor) {
 
 fn op_to_eol(ed: &mut Editor, op: char) {
     ed.vim.count.clear();
-    apply_op(ed, op, (ed.row, ed.col), (ed.row, ed.line_len(ed.row)), RangeKind::Charwise);
+    apply_op(
+        ed,
+        op,
+        (ed.row, ed.col),
+        (ed.row, ed.line_len(ed.row)),
+        RangeKind::Charwise,
+    );
 }
 
 fn first_nonblank(ed: &Editor, row: usize) -> usize {
-    ed.lines[row].chars().take_while(|c| c.is_whitespace()).count()
+    ed.lines[row]
+        .chars()
+        .take_while(|c| c.is_whitespace())
+        .count()
 }
 
 fn scroll_half(ed: &mut Editor, dir: isize) {
@@ -579,7 +624,13 @@ fn do_find(ed: &mut Editor, kind: char, target: char, count: usize) {
     if let Some(op) = ed.vim.operator.take() {
         // f/t are inclusive forward; F/T exclusive backward.
         if matches!(kind, 'f' | 't') {
-            apply_op(ed, op, (ed.row, ed.col), (ed.row, col + 1), RangeKind::Charwise);
+            apply_op(
+                ed,
+                op,
+                (ed.row, ed.col),
+                (ed.row, col + 1),
+                RangeKind::Charwise,
+            );
         } else {
             apply_op(ed, op, (ed.row, col), (ed.row, ed.col), RangeKind::Charwise);
         }
@@ -630,7 +681,10 @@ fn word_object(ed: &Editor, around: bool) -> Option<(usize, usize)> {
         e += 1;
     }
     if around && class != 0 {
-        let e2 = (e..chars.len()).take_while(|&i| chars[i].is_whitespace()).count() + e;
+        let e2 = (e..chars.len())
+            .take_while(|&i| chars[i].is_whitespace())
+            .count()
+            + e;
         if e2 > e {
             e = e2;
         } else {
@@ -694,7 +748,11 @@ fn bracket_object(ed: &Editor, open: char, close: char, around: bool) -> Option<
             depth += 1;
         } else if c == close {
             if depth == 0 {
-                return if around { Some((s, i + 1)) } else { Some((s + 1, i)) };
+                return if around {
+                    Some((s, i + 1))
+                } else {
+                    Some((s + 1, i))
+                };
             }
             depth -= 1;
         }
@@ -725,10 +783,19 @@ fn lines_operate(ed: &mut Editor, op: char, count: usize) {
 
 /// Apply operator over a resolved range. Charwise: [start, end) on a single
 /// line or spanning lines. Linewise: rows start.0..=end.0.
-fn apply_op(ed: &mut Editor, op: char, start: (usize, usize), end: (usize, usize), kind: RangeKind) {
+fn apply_op(
+    ed: &mut Editor,
+    op: char,
+    start: (usize, usize),
+    end: (usize, usize),
+    kind: RangeKind,
+) {
     ed.vim.count.clear();
     let text = range_text(ed, start, end, kind);
-    ed.vim.register = Register { text: text.clone(), linewise: kind == RangeKind::Linewise };
+    ed.vim.register = Register {
+        text: text.clone(),
+        linewise: kind == RangeKind::Linewise,
+    };
     let _ = crate::clipboard::copy(&text); // yanks land on the system clipboard too
 
     if op == 'y' {
@@ -842,7 +909,10 @@ fn join_lines(ed: &mut Editor, count: usize) {
 
 fn open_line(ed: &mut Editor, below: bool) {
     ed.push_undo();
-    let indent: String = ed.lines[ed.row].chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+    let indent: String = ed.lines[ed.row]
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect();
     let at = if below { ed.row + 1 } else { ed.row };
     ed.lines.insert(at, indent.clone());
     ed.row = at;
@@ -869,7 +939,11 @@ fn paste(ed: &mut Editor, after: bool, count: usize) {
         ed.row = at;
         ed.col = first_nonblank(ed, ed.row);
     } else {
-        let col = if after { (ed.col + 1).min(ed.line_len(ed.row)) } else { ed.col };
+        let col = if after {
+            (ed.col + 1).min(ed.line_len(ed.row))
+        } else {
+            ed.col
+        };
         ed.col = col;
         let text = reg.text.repeat(count);
         if text.contains('\n') {
@@ -917,7 +991,11 @@ fn visual_operate(ed: &mut Editor, op: char) {
     if b < a {
         std::mem::swap(&mut a, &mut b);
     }
-    let kind = if ed.mode == Mode::VisualLine { RangeKind::Linewise } else { RangeKind::Charwise };
+    let kind = if ed.mode == Mode::VisualLine {
+        RangeKind::Linewise
+    } else {
+        RangeKind::Charwise
+    };
     ed.vim.count.clear();
     ed.vim.operator = None;
     if kind == RangeKind::Charwise {
