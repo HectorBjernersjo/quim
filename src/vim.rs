@@ -239,13 +239,13 @@ pub fn handle_key(ed: &mut Editor, key: KeyEvent) -> Outcome {
         }
 
         // --- paste / undo ----------------------------------------------------
-        'p' => {
-            let count = take_count(ed).unwrap_or(1);
-            paste(ed, true, count);
-        }
-        'P' => {
-            let count = take_count(ed).unwrap_or(1);
-            paste(ed, false, count);
+        'p' | 'P' => {
+            if ed.mode != Mode::Normal {
+                visual_paste(ed);
+            } else {
+                let count = take_count(ed).unwrap_or(1);
+                paste(ed, c == 'p', count);
+            }
         }
         'u' => {
             ed.undo();
@@ -946,28 +946,76 @@ fn paste(ed: &mut Editor, after: bool, count: usize) {
         };
         ed.col = col;
         let text = reg.text.repeat(count);
-        if text.contains('\n') {
-            // multiline charwise paste: split the current line at the cursor
-            let idx = ed.byte_index(ed.row, ed.col);
-            let tail = ed.lines[ed.row].split_off(idx);
-            let mut parts = text.split('\n');
-            if let Some(first) = parts.next() {
-                ed.lines[ed.row].push_str(first);
-            }
-            let mut row = ed.row;
-            for part in parts {
-                row += 1;
-                ed.lines.insert(row, part.to_string());
-            }
-            ed.col = ed.line_len(row);
-            ed.row = row;
-            ed.lines[row].push_str(&tail);
-        } else {
-            let idx = ed.byte_index(ed.row, ed.col);
-            ed.lines[ed.row].insert_str(idx, &text);
-            ed.col += text.chars().count();
+        insert_charwise_at_cursor(ed, &text);
+    }
+    ed.clamp_normal_col();
+}
+
+/// Insert `text` at the cursor (before the current cell), splitting the line on
+/// newlines. Leaves the cursor on the last inserted char, matching vim's p/P.
+fn insert_charwise_at_cursor(ed: &mut Editor, text: &str) {
+    if text.contains('\n') {
+        // multiline charwise paste: split the current line at the cursor
+        let idx = ed.byte_index(ed.row, ed.col);
+        let tail = ed.lines[ed.row].split_off(idx);
+        let mut parts = text.split('\n');
+        if let Some(first) = parts.next() {
+            ed.lines[ed.row].push_str(first);
         }
-        ed.col = ed.col.saturating_sub(1);
+        let mut row = ed.row;
+        for part in parts {
+            row += 1;
+            ed.lines.insert(row, part.to_string());
+        }
+        ed.col = ed.line_len(row);
+        ed.row = row;
+        ed.lines[row].push_str(&tail);
+    } else {
+        let idx = ed.byte_index(ed.row, ed.col);
+        ed.lines[ed.row].insert_str(idx, text);
+        ed.col += text.chars().count();
+    }
+    ed.col = ed.col.saturating_sub(1);
+}
+
+/// `p`/`P` over a visual selection: delete the selection and put the register
+/// in its place (vim's visual paste). The register is left unchanged so the
+/// same text can be pasted over several selections in a row.
+fn visual_paste(ed: &mut Editor) {
+    let reg = ed.vim.register.clone();
+    let (mut a, mut b) = (ed.vanchor, (ed.row, ed.col));
+    if b < a {
+        std::mem::swap(&mut a, &mut b);
+    }
+    let linewise_sel = ed.mode == Mode::VisualLine;
+    ed.vim.count.clear();
+    ed.vim.operator = None;
+    ed.mode = Mode::Normal;
+    ed.push_undo();
+
+    if linewise_sel {
+        // Replace the whole selected lines with the register's lines.
+        let end = b.0.min(ed.lines.len() - 1);
+        ed.lines.drain(a.0..=end);
+        let mut at = a.0;
+        if !reg.text.is_empty() {
+            for line in reg.text.split('\n') {
+                ed.lines.insert(at, line.to_string());
+                at += 1;
+            }
+        }
+        if ed.lines.is_empty() {
+            ed.lines.push(String::new());
+        }
+        ed.row = a.0.min(ed.lines.len() - 1);
+        ed.col = first_nonblank(ed, ed.row);
+    } else {
+        // Charwise selection is inclusive of the cursor cell.
+        b.1 = (b.1 + 1).min(ed.line_len(b.0));
+        delete_charwise(ed, a, b); // cursor lands at the range start
+        if !reg.text.is_empty() {
+            insert_charwise_at_cursor(ed, &reg.text);
+        }
     }
     ed.clamp_normal_col();
 }
@@ -1010,4 +1058,59 @@ fn visual_operate(ed: &mut Editor, op: char) {
 pub fn visual_swap_ends(ed: &mut Editor) {
     std::mem::swap(&mut ed.vanchor.0, &mut ed.row);
     std::mem::swap(&mut ed.vanchor.1, &mut ed.col);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn press(ed: &mut Editor, keys: &str) {
+        for c in keys.chars() {
+            handle_key(ed, KeyEvent::from(KeyCode::Char(c)));
+        }
+    }
+
+    #[test]
+    fn visual_paste_replaces_charwise_selection() {
+        let mut ed = Editor::new("foo bar", true);
+        // yank "foo" into the register
+        ed.row = 0;
+        ed.col = 0;
+        press(&mut ed, "yw"); // yanks "foo " (word incl. trailing space)
+        // select "bar" and paste over it
+        ed.col = 4;
+        press(&mut ed, "ve"); // visual over "bar"
+        press(&mut ed, "p");
+        assert_eq!(ed.text(), "foo foo ");
+        assert!(ed.mode == Mode::Normal);
+    }
+
+    #[test]
+    fn visual_paste_leaves_register_intact() {
+        let mut ed = Editor::new("aa bb cc", true);
+        // yank "aa" (yiw in normal mode)
+        ed.col = 0;
+        press(&mut ed, "yiw");
+        // replace "bb": select both chars with v + l, then paste
+        ed.col = 3;
+        press(&mut ed, "vl");
+        press(&mut ed, "p");
+        // replace "cc" with the same register
+        ed.col = 6;
+        press(&mut ed, "vl");
+        press(&mut ed, "p");
+        assert_eq!(ed.text(), "aa aa aa");
+    }
+
+    #[test]
+    fn visual_line_paste_replaces_whole_line() {
+        let mut ed = Editor::new("one\ntwo\nthree", true);
+        ed.row = 0;
+        ed.col = 0;
+        press(&mut ed, "yy"); // yank "one" linewise
+        ed.row = 1;
+        press(&mut ed, "V"); // visual-line over "two"
+        press(&mut ed, "p");
+        assert_eq!(ed.text(), "one\none\nthree");
+    }
 }
