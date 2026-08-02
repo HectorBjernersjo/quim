@@ -563,6 +563,9 @@ fn category_style(cell: &Option<String>, category: Category) -> Style {
 fn draw_results(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Pane::Results;
     let title = match &app.view {
+        Some(v) if v.error.is_none() && v.rows.is_empty() && !v.cols.is_empty() => {
+            format!("Results · 0 rows · col {}/{}", v.sel_col + 1, v.cols.len())
+        }
         Some(v) if v.error.is_none() && !v.rows.is_empty() => {
             let visual = match v.vsel_range() {
                 Some((lo, hi)) => format!(" · V {} row(s)", hi - lo + 1),
@@ -636,7 +639,7 @@ fn draw_results(f: &mut Frame, app: &mut App, area: Rect) {
 
     let width = inner.width as usize;
     let rownum_w = view.rows.len().to_string().len().max(2);
-    let body_h = (inner.height as usize).saturating_sub(2); // header + separator
+    let body_h = (inner.height as usize).saturating_sub(3); // name + type + separator
 
     // Horizontal window: make sure the selected column fits.
     if view.sel_col < view.col_off {
@@ -663,6 +666,7 @@ fn draw_results(f: &mut Frame, app: &mut App, area: Rect) {
         pad("#", rownum_w) + "  ",
         Style::new().fg(theme::FAINT),
     )];
+    let mut types = vec![Span::raw(" ".repeat(rownum_w + 2))];
     let mut sep = vec![Span::styled(
         "─".repeat(rownum_w + 2),
         Style::new().fg(theme::BORDER_SOFT),
@@ -674,13 +678,34 @@ fn draw_results(f: &mut Frame, app: &mut App, area: Rect) {
     for c in view.col_off..view.cols.len() {
         let w = view.widths[c] as usize;
         last_col = c;
+        // The header marks the cursor column, which is the only cue there is
+        // when the result has no rows to put a cell cursor on.
+        let sel = c == view.sel_col && focused;
         header.push(Span::styled(
             pad(&fit(&view.cols[c].name, w), w) + "  ",
-            Style::new().fg(theme::MUTED).add_modifier(Modifier::BOLD),
+            if sel {
+                Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(theme::MUTED).add_modifier(Modifier::BOLD)
+            },
+        ));
+        types.push(Span::styled(
+            pad(&fit(&view.cols[c].ty, w), w) + "  ",
+            Style::new()
+                .fg(if sel { theme::ACCENT_DIM } else { theme::FAINT })
+                .add_modifier(Modifier::ITALIC),
         ));
         sep.push(Span::styled(
-            "─".repeat(w + 2),
-            Style::new().fg(theme::BORDER_SOFT),
+            if sel {
+                "━".repeat(w) + "  "
+            } else {
+                "─".repeat(w + 2)
+            },
+            Style::new().fg(if sel {
+                theme::ACCENT
+            } else {
+                theme::BORDER_SOFT
+            }),
         ));
         used += w + 2;
         if used >= width {
@@ -694,7 +719,13 @@ fn draw_results(f: &mut Frame, app: &mut App, area: Rect) {
         .fg(theme::SEARCH_FG)
         .bg(theme::SEARCH_BG)
         .add_modifier(Modifier::BOLD);
-    let mut lines = vec![Line::from(header), Line::from(sep)];
+    let mut lines = vec![Line::from(header), Line::from(types), Line::from(sep)];
+    if view.rows.is_empty() {
+        lines.push(Line::styled(
+            format!("{}(no rows)", " ".repeat(rownum_w + 2)),
+            Style::new().fg(theme::MUTED),
+        ));
+    }
     for r in range {
         let row = &view.rows[r];
         let in_vsel = vsel.is_some_and(|(lo, hi)| r >= lo && r <= hi);
@@ -1587,4 +1618,116 @@ fn wrap_spans(spans: &[(String, Color)], width: usize, out: &mut Vec<Line<'stati
     }
     flush_span(&mut line, &mut cur, cur_color);
     out.push(Line::from(line));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::QueryView;
+    use crate::config::Config;
+    use crate::db::ColMeta;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn empty_result_view() -> QueryView {
+        let cols = vec![
+            ColMeta {
+                name: "id".into(),
+                ty: "int4".into(),
+                category: Category::Num,
+            },
+            ColMeta {
+                name: "name".into(),
+                ty: "varchar".into(),
+                category: Category::Str,
+            },
+        ];
+        let widths = vec![4, 7];
+        QueryView {
+            cols,
+            rows: vec![],
+            widths,
+            sel_row: 0,
+            sel_col: 0,
+            row_off: 0,
+            col_off: 0,
+            vsel: None,
+            error: None,
+            search: String::new(),
+            searching: false,
+            search_hits: vec![],
+        }
+    }
+
+    /// The rendered screen as one string per row.
+    fn render(view: QueryView) -> Vec<String> {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Config::default(), tx);
+        app.view = Some(view);
+        app.focus = Pane::Results;
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(100)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn empty_result_still_renders_column_names_and_types() {
+        let text = render(empty_result_view());
+
+        let header = text
+            .iter()
+            .position(|line| line.contains("id") && line.contains("name"))
+            .expect("header row with column names");
+        // The type row sits directly under the names, aligned to the same columns.
+        assert!(text[header + 1].contains("int4"));
+        assert!(text[header + 1].contains("varchar"));
+        assert_eq!(
+            text[header].find("name"),
+            text[header + 1].find("varchar"),
+            "type must line up under its column name"
+        );
+        assert!(text.iter().any(|line| line.contains("(no rows)")));
+        assert!(text.iter().any(|line| line.contains("0 rows")));
+    }
+
+    /// With no rows there is no cell cursor, so the heavy rule under the header
+    /// is the only thing showing which column h/l moved to.
+    #[test]
+    fn cursor_column_is_marked_in_the_header_of_an_empty_result() {
+        // Box-drawing characters are multi-byte, so positions are counted in
+        // characters — a byte offset would not line up between rows.
+        let column_of = |line: &str, needle: &str| {
+            line.find(needle)
+                .map(|byte| line[..byte].chars().count())
+                .expect("needle on line")
+        };
+        let rule_at = |view: QueryView| {
+            let text = render(view);
+            let header = text
+                .iter()
+                .position(|line| line.contains("id") && line.contains("name"))
+                .expect("header row with column names");
+            let rule = column_of(&text[header + 2], "━");
+            (
+                column_of(&text[header], "id"),
+                column_of(&text[header], "name"),
+                rule,
+            )
+        };
+
+        let (id_at, name_at, rule) = rule_at(empty_result_view());
+        assert_eq!(rule, id_at, "column 0 selected");
+
+        let mut view = empty_result_view();
+        view.sel_col = 1;
+        let (_, _, rule) = rule_at(view);
+        assert_eq!(rule, name_at, "column 1 selected");
+    }
 }

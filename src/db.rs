@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
-use sqlx::{Column, PgPool, Row, SqlitePool, TypeInfo, ValueRef};
+use sqlx::{Column, Executor, PgPool, Row, SqlitePool, TypeInfo, ValueRef};
 use tiberius::{Client, ColumnData, ColumnType, Config as TdsConfig, FromSql};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -89,6 +89,8 @@ pub enum Category {
 #[derive(Clone)]
 pub struct ColMeta {
     pub name: String,
+    /// The declared type as the server reports it, shown under the column name.
+    pub ty: String,
     pub category: Category,
 }
 
@@ -448,6 +450,7 @@ async fn mssql_run_query(
                 cols.iter()
                     .map(|c| ColMeta {
                         name: c.name().to_string(),
+                        ty: mssql_type_name(c.column_type()).to_string(),
                         category: categorize(c.column_type()),
                     })
                     .collect()
@@ -478,6 +481,46 @@ fn categorize(ty: ColumnType) -> Category {
         BigVarBin | BigBinary | Image => Category::Bin,
         BigVarChar | BigChar | NVarchar | NChar | Text | NText | Xml => Category::Str,
         _ => Category::Other,
+    }
+}
+
+/// TDS wire types mapped back to the T-SQL names people write in DDL. The
+/// variable-length `*n` variants can't be told apart from their fixed-size
+/// siblings here, so they map to the most common spelling.
+fn mssql_type_name(ty: ColumnType) -> &'static str {
+    use ColumnType::*;
+    match ty {
+        Null => "null",
+        Bit | Bitn => "bit",
+        Int1 => "tinyint",
+        Int2 => "smallint",
+        Int4 | Intn => "int",
+        Int8 => "bigint",
+        Float4 => "real",
+        Float8 | Floatn => "float",
+        Money => "money",
+        Money4 => "smallmoney",
+        Decimaln => "decimal",
+        Numericn => "numeric",
+        Guid => "uniqueidentifier",
+        Datetime | Datetimen => "datetime",
+        Datetime4 => "smalldatetime",
+        Datetime2 => "datetime2",
+        Daten => "date",
+        Timen => "time",
+        DatetimeOffsetn => "datetimeoffset",
+        BigVarBin => "varbinary",
+        BigBinary => "binary",
+        Image => "image",
+        BigVarChar => "varchar",
+        BigChar => "char",
+        NVarchar => "nvarchar",
+        NChar => "nchar",
+        Text => "text",
+        NText => "ntext",
+        Xml => "xml",
+        Udt => "udt",
+        SSVariant => "sql_variant",
     }
 }
 
@@ -674,18 +717,15 @@ async fn pg_run_query(
     let pool = get_pg_pool(pools, conn_str, database).await?;
     query_timeout(async {
         let rows = sqlx::query(sql).fetch_all(pool).await.map_err(sqlx_error)?;
-        let columns = rows
-            .first()
-            .map(|row| {
-                row.columns()
-                    .iter()
-                    .map(|c| ColMeta {
-                        name: c.name().to_string(),
-                        category: categorize_decl(c.type_info().name()),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let columns = match rows.first() {
+            Some(row) => col_metas(row.columns()),
+            // No rows came back, so the shape has to be asked for separately:
+            // describing only prepares the statement, it does not run it again.
+            None => match pool.describe(sql).await {
+                Ok(described) => col_metas(described.columns()),
+                Err(_) => vec![],
+            },
+        };
         let rows = rows
             .iter()
             .map(|row| {
@@ -866,18 +906,13 @@ async fn sqlite_run_query(
     let pool = get_sqlite_pool(pools, conn_str).await?;
     query_timeout(async {
         let rows = sqlx::query(sql).fetch_all(pool).await.map_err(sqlx_error)?;
-        let columns = rows
-            .first()
-            .map(|row| {
-                row.columns()
-                    .iter()
-                    .map(|c| ColMeta {
-                        name: c.name().to_string(),
-                        category: categorize_decl(c.type_info().name()),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let columns = match rows.first() {
+            Some(row) => col_metas(row.columns()),
+            None => match pool.describe(sql).await {
+                Ok(described) => col_metas(described.columns()),
+                Err(_) => vec![],
+            },
+        };
         let rows = rows
             .iter()
             .map(|row| {
@@ -927,6 +962,20 @@ async fn query_timeout<T>(
 
 fn sqlx_error(e: sqlx::Error) -> String {
     e.to_string()
+}
+
+fn col_metas<C: Column>(columns: &[C]) -> Vec<ColMeta> {
+    columns
+        .iter()
+        .map(|c| {
+            let ty = c.type_info().name();
+            ColMeta {
+                name: c.name().to_string(),
+                ty: ty.to_ascii_lowercase(),
+                category: categorize_decl(ty),
+            }
+        })
+        .collect()
 }
 
 fn table_infos_from_rows(
@@ -1076,5 +1125,48 @@ mod tests {
                 Some("0x0a0b".into())
             ]
         );
+    }
+
+    #[test]
+    fn sqlite_query_without_rows_still_reports_columns_and_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = dir.path().join("app.db").to_string_lossy().to_string();
+        let (tx, rx) = spawn_worker();
+
+        let run = |sql: &str| {
+            tx.send(DbRequest::Query {
+                engine: "sqlite".into(),
+                conn: conn.clone(),
+                database: "main".into(),
+                sql: sql.into(),
+            })
+            .unwrap();
+            match recv(&rx) {
+                DbResponse::Query(out) => out,
+                _ => panic!("expected query response"),
+            }
+        };
+
+        assert_eq!(
+            run("CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, born DATE)").error,
+            None
+        );
+        let out = run("SELECT id, name, born FROM people WHERE id = -1");
+        assert_eq!(out.error, None);
+        assert!(out.rows.is_empty());
+        assert_eq!(
+            out.columns
+                .iter()
+                .map(|col| (col.name.as_str(), col.ty.as_str()))
+                .collect::<Vec<_>>(),
+            [("id", "integer"), ("name", "text"), ("born", "date")]
+        );
+        assert!(out.columns[0].category == Category::Num);
+        assert!(out.columns[2].category == Category::Date);
+
+        // A statement that returns nothing at all still has no columns.
+        assert!(run("INSERT INTO people (name) VALUES ('Ada')")
+            .columns
+            .is_empty());
     }
 }

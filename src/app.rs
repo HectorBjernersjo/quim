@@ -2283,7 +2283,10 @@ fn compute_widths(cols: &[ColMeta], rows: &[Vec<Option<String>>]) -> Vec<u16> {
                 }
             }
             // Only the data is capped — the column name is always shown in full.
-            data_w.clamp(4, 60).max(col.name.width().min(200)) as u16
+            data_w
+                .clamp(4, 60)
+                .max(col.name.width().min(200))
+                .max(col.ty.width().min(200)) as u16
         })
         .collect()
 }
@@ -2296,10 +2299,12 @@ mod tests {
         let cols = vec![
             ColMeta {
                 name: "a".into(),
+                ty: "text".into(),
                 category: Category::Other,
             },
             ColMeta {
                 name: "b".into(),
+                ty: "text".into(),
                 category: Category::Other,
             },
         ];
