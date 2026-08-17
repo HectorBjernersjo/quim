@@ -19,7 +19,7 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub enum DbRequest {
     ListDatabases {
-        server_id: String,
+        conn_id: String,
         engine: String,
         conn: String,
     },
@@ -35,7 +35,7 @@ pub enum DbRequest {
         database: String,
         sql: String,
     },
-    /// Connect and run SELECT 1; used by the source editor before saving.
+    /// Connect and run SELECT 1; used before saving a connection and by t.
     TestConnection {
         token: String,
         engine: String,
@@ -46,7 +46,7 @@ pub enum DbRequest {
 
 pub enum DbResponse {
     Databases {
-        server_id: String,
+        conn_id: String,
         result: Result<Vec<String>, String>,
     },
     Schema {
@@ -130,11 +130,11 @@ pub fn spawn_worker() -> (Sender<DbRequest>, Receiver<DbResponse>) {
 async fn handle(pools: &mut DbPools, req: DbRequest) -> DbResponse {
     match req {
         DbRequest::ListDatabases {
-            server_id,
+            conn_id,
             engine,
             conn,
         } => DbResponse::Databases {
-            server_id,
+            conn_id,
             result: list_databases(pools, &engine, &conn).await,
         },
         DbRequest::Schema {
@@ -214,9 +214,7 @@ async fn list_databases(
     match engine_name(engine).as_str() {
         "mssql" => mssql_list_databases(&mut pools.mssql, conn_str).await,
         "postgres" | "postgresql" => pg_list_databases(&mut pools.postgres, conn_str).await,
-        "sqlite" => {
-            Err("SQLite is a single database file; add it as a standalone database.".into())
-        }
+        "sqlite" => Err("SQLite is a single database file — it has nothing to list.".into()),
         _ => Err(unsupported_engine(engine)),
     }
 }

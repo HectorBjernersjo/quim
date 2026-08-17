@@ -5,7 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 
 use crate::clipboard;
-use crate::config::{self, Config, DatabaseCfg, DbSelection, ServerCfg};
+use crate::config::{self, Config, ConnectionCfg, DbSelection};
 use crate::db::{Category, ColMeta, DbRequest, DbResponse, QueryOutcome, TableInfo};
 use crate::editor::{Editor, Mode};
 use crate::highlight;
@@ -41,15 +41,37 @@ pub enum StatusKind {
     Err,
 }
 
+/// One database quim can point a query at. Every connection contributes at
+/// least one; a host contributes one per database it lists.
 #[derive(Clone)]
 pub struct DbEntry {
+    /// "<connectionId>:<database>" — stable across restarts.
     pub id: String,
+    /// What the sidebar row says: the database name, or the connection name
+    /// when the connection is a single database.
     pub name: String,
+    /// Name used while filtering, disambiguated when two connections share it.
     pub label: String,
     pub engine: String,
-    pub server: Option<String>,
+    pub conn_id: String,
+    pub conn_name: String,
     pub conn: String,
     pub database: String,
+    /// False for a database the host has but this connection hides.
+    pub included: bool,
+}
+
+/// One line of the sidebar tree.
+#[derive(Clone, Copy, PartialEq)]
+pub enum SideRow {
+    /// A host, by index into `cfg.connections`.
+    Conn(usize),
+    /// A database, by index into `App::dbs`.
+    Db(usize),
+}
+
+pub fn entry_id(conn_id: &str, database: &str) -> String {
+    format!("{conn_id}:{database}")
 }
 
 #[derive(Default)]
@@ -103,7 +125,12 @@ impl QueryView {
     /// True when the displayed text of a cell contains the (lowercased) search
     /// term. `needle` must already be lowercased.
     pub fn cell_matches(&self, r: usize, c: usize, needle: &str) -> bool {
-        let cell = self.rows.get(r).and_then(|row| row.get(c)).cloned().flatten();
+        let cell = self
+            .rows
+            .get(r)
+            .and_then(|row| row.get(c))
+            .cloned()
+            .flatten();
         crate::ui::display_text(&cell, self.cols[c].category)
             .to_lowercase()
             .contains(needle)
@@ -144,40 +171,50 @@ pub struct Areas {
     pub detail: Rect,
 }
 
-// --- Source editor (add/edit servers & databases) --------------------------------
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum SourceKind {
-    Server,
-    Database,
-}
+// --- Connection editor -------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum FormField {
-    Kind,
-    Engine,
     Name,
     Conn,
-    Fetch,
-    AllToggle,
+    Engine,
+    Scope,
     DbList,
     Save,
     Cancel,
 }
 
+/// What the connection should list.
+#[derive(Clone, Copy, PartialEq)]
+pub enum FormScope {
+    /// Whatever the connection string implies — one database if it names one,
+    /// otherwise the whole host. Also what leaves an existing pick alone.
+    Auto,
+    All,
+    Pick,
+}
+
+/// Add/edit dialog for a connection. Name and connection string are the only
+/// things typed in; the engine row shows what was derived and doubles as the
+/// override when the string is too exotic to read. The scope row is where a
+/// host's databases are picked from the full list.
 #[derive(Clone)]
 pub struct SourceForm {
-    pub kind: SourceKind,
-    pub engine: String,
     pub editing_id: Option<String>,
     pub name: String,
     pub conn: String,
     pub cursor: usize, // char index in the focused text field
-    pub all_dbs: bool,
+    /// None = whatever the connection string looks like.
+    pub engine_override: Option<String>,
+    pub scope: FormScope,
+    /// Every database the host reported, and whether it is picked. Fetched the
+    /// first time the scope is set to Pick, so the list is always the live one
+    /// rather than whatever happens to be in the sidebar.
     pub db_list: Vec<(String, bool)>,
     pub list_sel: usize,
-    pub focus: FormField,
     pub fetching: bool,
+    pub fetched: bool,
+    pub focus: FormField,
     pub saving: bool,
     pub error: Option<String>,
 }
@@ -185,41 +222,52 @@ pub struct SourceForm {
 impl SourceForm {
     fn new_add() -> Self {
         SourceForm {
-            kind: SourceKind::Server,
-            engine: "mssql".into(),
             editing_id: None,
             name: String::new(),
             conn: String::new(),
             cursor: 0,
-            all_dbs: true,
+            engine_override: None,
+            scope: FormScope::Auto,
             db_list: vec![],
             list_sel: 0,
-            focus: FormField::Kind,
             fetching: false,
+            fetched: false,
+            focus: FormField::Name,
             saving: false,
             error: None,
         }
     }
 
-    /// Visible fields, in tab order.
+    /// Visible fields, in tab order. Scope only means something for an engine
+    /// that can enumerate databases.
     pub fn fields(&self) -> Vec<FormField> {
-        let mut out = vec![];
-        if self.editing_id.is_none() {
-            out.push(FormField::Kind);
-        }
-        out.push(FormField::Engine);
-        out.push(FormField::Name);
-        out.push(FormField::Conn);
-        if self.kind == SourceKind::Server && config::supports_server_sources(&self.engine) {
-            out.push(FormField::Fetch);
-            out.push(FormField::AllToggle);
-            if !self.all_dbs && !self.db_list.is_empty() {
+        let mut out = vec![FormField::Name, FormField::Conn, FormField::Engine];
+        if config::supports_listing(&self.engine()) {
+            out.push(FormField::Scope);
+            if self.scope == FormScope::Pick && !self.db_list.is_empty() {
                 out.push(FormField::DbList);
             }
         }
         out.push(FormField::Save);
         out.push(FormField::Cancel);
         out
+    }
+
+    pub fn picked(&self) -> Vec<String> {
+        self.db_list
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// The engine this connection will use: the override, else what the string
+    /// looks like. Empty when neither says anything.
+    pub fn engine(&self) -> String {
+        match &self.engine_override {
+            Some(engine) => engine.clone(),
+            None => config::detect_engine(&self.conn).unwrap_or_default(),
+        }
     }
 
     fn move_focus(&mut self, delta: isize) {
@@ -242,46 +290,58 @@ impl SourceForm {
         }
     }
 
-    fn cycle_engine(&mut self) {
-        const ENGINES: &[&str] = &["mssql", "postgres", "sqlite"];
-        let current = config::normalize_engine(&self.engine);
-        let idx = ENGINES
-            .iter()
-            .position(|engine| *engine == current)
-            .unwrap_or(0);
-        self.engine = ENGINES[(idx + 1) % ENGINES.len()].into();
-        if !config::supports_server_sources(&self.engine)
-            && self.kind == SourceKind::Server
-            && self.editing_id.is_none()
-        {
-            self.kind = SourceKind::Database;
-        }
+    /// Step through auto → mssql → postgres → sqlite → auto.
+    fn cycle_engine(&mut self, delta: isize) {
+        let len = config::ENGINES.len() as isize + 1;
+        let cur = match &self.engine_override {
+            None => 0,
+            Some(engine) => config::ENGINES
+                .iter()
+                .position(|e| *e == engine)
+                .map(|i| i as isize + 1)
+                .unwrap_or(0),
+        };
+        let next = (cur + delta).rem_euclid(len);
+        self.engine_override = if next == 0 {
+            None
+        } else {
+            Some(config::ENGINES[(next - 1) as usize].to_string())
+        };
+    }
+
+    /// Step through auto → all → pick → auto. Returns true when it landed on
+    /// Pick without a list yet, so the caller can go and fetch one.
+    fn cycle_scope(&mut self, delta: isize) -> bool {
+        const ORDER: [FormScope; 3] = [FormScope::Auto, FormScope::All, FormScope::Pick];
+        let cur = ORDER.iter().position(|s| *s == self.scope).unwrap_or(0) as isize;
+        self.scope = ORDER[(cur + delta).rem_euclid(3) as usize];
+        self.list_sel = 0;
+        self.scope == FormScope::Pick && !self.fetched && !self.fetching
     }
 }
 
+/// What a y/n prompt will do. Deleting a connection throws away a connection
+/// string; hiding a database only stops listing it — different weights, so the
+/// prompt says which one it is.
 #[derive(Clone)]
-pub enum SourceTarget {
-    Server(String),
-    Database(String),
+pub enum ConfirmAction {
+    DeleteConnection(String),
+    HideDatabase { conn_id: String, database: String },
+}
+
+impl ConfirmAction {
+    pub fn is_delete(&self) -> bool {
+        matches!(self, ConfirmAction::DeleteConnection(_))
+    }
 }
 
 // --- Settings screen --------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum SettingsSection {
-    General,
-    Servers,
-    Databases,
-}
-
 pub struct SettingsState {
-    pub section: SettingsSection,
-    /// false = the section list has focus, true = the section's content.
-    pub in_content: bool,
     pub row: usize,
 }
 
-/// Rows in the General section, in display order.
+/// Rows on the settings screen, in display order.
 pub const GENERAL_ROWS: usize = 2;
 
 pub struct App {
@@ -289,10 +349,13 @@ pub struct App {
     req_tx: Sender<DbRequest>,
 
     pub dbs: Vec<DbEntry>,
+    /// The sidebar tree: connections with their databases underneath.
+    pub rows: Vec<SideRow>,
     pub db_list: FilterList,
     pub tbl_list: FilterList,
-    server_dbs: HashMap<String, Vec<String>>,
-    pub pending_servers: usize,
+    /// Databases each connection reported, by connection id.
+    fetched: HashMap<String, Vec<String>>,
+    pub pending_lists: usize,
 
     pub active: Option<DbEntry>,
     pub tables: Vec<TableInfo>,
@@ -312,7 +375,8 @@ pub struct App {
 
     pub resize_mode: bool,
     pub form: Option<SourceForm>,
-    pub confirm: Option<(String, SourceTarget)>,
+    /// (prompt, connection id) while a delete waits for y/n.
+    pub confirm: Option<(String, ConfirmAction)>,
     pub settings: Option<SettingsState>,
     form_token: usize,
 }
@@ -324,10 +388,11 @@ impl App {
             cfg,
             req_tx,
             dbs: vec![],
+            rows: vec![],
             db_list: FilterList::default(),
             tbl_list: FilterList::default(),
-            server_dbs: HashMap::new(),
-            pending_servers: 0,
+            fetched: HashMap::new(),
+            pending_lists: 0,
             active: None,
             tables: vec![],
             tables_loading: false,
@@ -352,106 +417,116 @@ impl App {
     }
 
     fn bootstrap(&mut self) {
-        if self.cfg.servers.is_empty() && self.cfg.databases.is_empty() {
+        if self.cfg.connections.is_empty() {
             self.set_status(
-                "No sources — press , to open Settings and add one".into(),
+                "No connections — press a to add one".into(),
                 StatusKind::Err,
             );
             return;
         }
-        for server in self.cfg.servers.clone() {
-            if !config::supported_engine(&server.engine) {
+        for c in self.cfg.connections.clone() {
+            let engine = c.engine();
+            if !config::supported_engine(&engine) {
                 self.set_status(
-                    format!(
-                        "{}: engine \"{}\" is not supported yet",
-                        server.name, server.engine
-                    ),
+                    format!("{}: could not tell which engine this is", c.name),
                     StatusKind::Err,
                 );
                 continue;
             }
-            if !config::supports_server_sources(&server.engine) {
-                self.set_status(
-                    format!(
-                        "{}: SQLite sources must be standalone databases",
-                        server.name
-                    ),
-                    StatusKind::Err,
-                );
-                continue;
-            }
-            if server.databases.is_all() {
-                self.pending_servers += 1;
-                let _ = self.req_tx.send(DbRequest::ListDatabases {
-                    server_id: server.id.clone(),
-                    engine: server.engine.clone(),
-                    conn: server.connection_string.clone(),
-                });
+            // Only a connection that lists everything needs a round-trip before
+            // its databases are known; a narrowed one already names them.
+            if c.databases.is_all() && config::supports_listing(&engine) {
+                self.request_databases(&c);
             }
         }
-        if self.pending_servers > 0 {
+        if self.pending_lists > 0 {
             self.set_status("Loading databases…".into(), StatusKind::Info);
         }
         self.rebuild_entries();
     }
 
+    fn request_databases(&mut self, c: &ConnectionCfg) {
+        self.pending_lists += 1;
+        let _ = self.req_tx.send(DbRequest::ListDatabases {
+            conn_id: c.id.clone(),
+            engine: c.engine(),
+            conn: c.connection_string.clone(),
+        });
+    }
+
+    /// Rebuild both the flat list of reachable databases and the sidebar tree.
+    /// `dbs` holds every database quim knows of — collapsed ones included, so
+    /// the filter and the remembered selection still find them.
     fn rebuild_entries(&mut self) {
-        let mut out: Vec<DbEntry> = vec![];
-        for s in &self.cfg.servers {
-            if !config::supported_engine(&s.engine) || !config::supports_server_sources(&s.engine) {
+        let mut dbs: Vec<DbEntry> = vec![];
+        let mut rows: Vec<SideRow> = vec![];
+        for (ci, c) in self.cfg.connections.iter().enumerate() {
+            let engine = c.engine();
+            if !config::supported_engine(&engine) {
+                // Still listed, so it can be fixed or deleted from the sidebar.
+                rows.push(SideRow::Conn(ci));
                 continue;
             }
-            let names: Vec<String> = match &s.databases {
-                config::DbSelection::Named(list) => list.clone(),
-                config::DbSelection::All(_) => {
-                    self.server_dbs.get(&s.id).cloned().unwrap_or_default()
-                }
-            };
-            for name in names {
-                out.push(DbEntry {
-                    id: format!("s:{}:{}", s.id, name),
-                    name: name.clone(),
+            let push = |dbs: &mut Vec<DbEntry>, name: String, database: String, included| {
+                dbs.push(DbEntry {
+                    id: entry_id(&c.id, &database),
+                    name,
                     label: String::new(),
-                    engine: config::normalize_engine(&s.engine),
-                    server: Some(s.name.clone()),
-                    conn: s.connection_string.clone(),
-                    database: name,
+                    engine: engine.clone(),
+                    conn_id: c.id.clone(),
+                    conn_name: c.name.clone(),
+                    conn: c.connection_string.clone(),
+                    database,
+                    included,
                 });
-            }
-        }
-        for d in &self.cfg.databases {
-            if !config::supported_engine(&d.engine) {
+                dbs.len() - 1
+            };
+
+            if c.is_single_database() {
+                let i = push(&mut dbs, c.name.clone(), c.single_database(), true);
+                rows.push(SideRow::Db(i));
                 continue;
             }
-            let database = config::database_of_engine(&d.engine, &d.connection_string)
-                .unwrap_or_else(|| d.name.clone());
-            out.push(DbEntry {
-                id: format!("d:{}", d.id),
-                name: d.name.clone(),
-                label: String::new(),
-                engine: config::normalize_engine(&d.engine),
-                server: None,
-                conn: d.connection_string.clone(),
-                database,
-            });
+
+            rows.push(SideRow::Conn(ci));
+            // What the host reported, plus anything the selection names in case
+            // it was never listed (or the listing failed).
+            let mut known = self.fetched.get(&c.id).cloned().unwrap_or_default();
+            for name in c.databases.names() {
+                if !known.contains(name) {
+                    known.push(name.clone());
+                }
+            }
+            known.sort_by_key(|name| name.to_lowercase());
+            let expanded = !self.cfg.quim.collapsed.contains(&c.id);
+            for name in known {
+                let included = c.databases.includes(&name);
+                let i = push(&mut dbs, name.clone(), name, included);
+                if expanded {
+                    rows.push(SideRow::Db(i));
+                }
+            }
         }
-        // Disambiguate labels only on name collisions.
+        // Only qualify a name when two connections both have it.
         let mut counts: HashMap<&str, usize> = HashMap::new();
-        for e in &out {
+        for e in &dbs {
             *counts.entry(e.name.as_str()).or_default() += 1;
         }
-        let labels: Vec<String> = out
+        let labels: Vec<String> = dbs
             .iter()
-            .map(|e| match (&e.server, counts[e.name.as_str()] > 1) {
-                (Some(srv), true) => format!("{} ({srv})", e.name),
-                _ => e.name.clone(),
+            .map(|e| {
+                if counts[e.name.as_str()] > 1 && e.name != e.conn_name {
+                    format!("{} ({})", e.name, e.conn_name)
+                } else {
+                    e.name.clone()
+                }
             })
             .collect();
-        for (e, label) in out.iter_mut().zip(labels) {
+        for (e, label) in dbs.iter_mut().zip(labels) {
             e.label = label;
         }
-        out.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
-        self.dbs = out;
+        self.dbs = dbs;
+        self.rows = rows;
 
         if let Some(active) = &self.active {
             if !self.dbs.iter().any(|d| d.id == active.id) {
@@ -459,9 +534,9 @@ impl App {
             }
         }
         if self.active.is_none() {
-            // Prefer the persisted selection; while server lists are still
+            // Prefer the persisted selection; while database lists are still
             // loading, hold off on the first-entry fallback so the remembered
-            // database wins once its server reports in.
+            // database wins once its connection reports in.
             let remembered = self
                 .cfg
                 .quim
@@ -471,7 +546,7 @@ impl App {
                 .cloned();
             if let Some(entry) = remembered {
                 self.select_db(entry);
-            } else if self.pending_servers == 0 {
+            } else if self.pending_lists == 0 {
                 if let Some(first) = self.dbs.first().cloned() {
                     self.select_db(first);
                 }
@@ -498,6 +573,17 @@ impl App {
                 self.set_status(format!("✕ {e}"), StatusKind::Err);
             }
         }
+        // Park the cursor on it, so the ● is on screen after a restart even
+        // when the remembered database sits far down the tree.
+        if let Some(i) = self.dbs.iter().position(|d| d.id == entry.id) {
+            if let Some(row) = self
+                .visible_rows()
+                .iter()
+                .position(|r| *r == SideRow::Db(i))
+            {
+                self.db_list.sel = row;
+            }
+        }
         self.active = Some(entry);
     }
 
@@ -507,14 +593,38 @@ impl App {
 
     // --- Filtered views --------------------------------------------------------
 
-    pub fn filtered_dbs(&self) -> Vec<usize> {
+    /// The sidebar rows to draw. Filtering drops the tree and jumps straight to
+    /// the matching databases — the fast way to reach one by name.
+    pub fn visible_rows(&self) -> Vec<SideRow> {
         let f = self.db_list.filter.to_lowercase();
-        self.dbs
+        if f.is_empty() {
+            return self.rows.clone();
+        }
+        let mut hits: Vec<usize> = self
+            .dbs
             .iter()
             .enumerate()
-            .filter(|(_, d)| f.is_empty() || d.label.to_lowercase().contains(&f))
+            .filter(|(_, d)| d.included && d.label.to_lowercase().contains(&f))
             .map(|(i, _)| i)
-            .collect()
+            .collect();
+        hits.sort_by_key(|&i| self.dbs[i].label.to_lowercase());
+        hits.into_iter().map(SideRow::Db).collect()
+    }
+
+    /// The row under the cursor.
+    pub fn selected_row(&self) -> Option<SideRow> {
+        self.visible_rows().get(self.db_list.sel).copied()
+    }
+
+    /// The connection the cursor is on, or the one owning the database it is on.
+    fn selected_conn(&self) -> Option<usize> {
+        match self.selected_row()? {
+            SideRow::Conn(ci) => Some(ci),
+            SideRow::Db(i) => {
+                let id = &self.dbs.get(i)?.conn_id;
+                self.cfg.connections.iter().position(|c| &c.id == id)
+            }
+        }
     }
 
     pub fn filtered_tables(&self) -> Vec<usize> {
@@ -536,27 +646,27 @@ impl App {
 
     pub fn on_db_response(&mut self, resp: DbResponse) {
         match resp {
-            DbResponse::Databases { server_id, result } => {
-                if server_id.starts_with("@form:") {
-                    self.on_form_fetch(server_id, result);
+            DbResponse::Databases { conn_id, result } => {
+                if conn_id.starts_with("@form:") {
+                    self.on_form_fetch(conn_id, result);
                     return;
                 }
-                self.pending_servers = self.pending_servers.saturating_sub(1);
+                self.pending_lists = self.pending_lists.saturating_sub(1);
                 match result {
                     Ok(names) => {
-                        self.server_dbs.insert(server_id, names);
-                        if self.pending_servers == 0 && matches!(self.status.1, StatusKind::Info) {
+                        self.fetched.insert(conn_id, names);
+                        if self.pending_lists == 0 && matches!(self.status.1, StatusKind::Info) {
                             self.set_status(String::new(), StatusKind::Info);
                         }
                     }
                     Err(e) => {
                         let name = self
                             .cfg
-                            .servers
+                            .connections
                             .iter()
-                            .find(|s| s.id == server_id)
-                            .map(|s| s.name.clone())
-                            .unwrap_or(server_id);
+                            .find(|c| c.id == conn_id)
+                            .map(|c| c.name.clone())
+                            .unwrap_or(conn_id);
                         self.set_status(format!("⚠ {name}: {e}"), StatusKind::Err);
                     }
                 }
@@ -931,102 +1041,23 @@ impl App {
     // --- Settings screen -------------------------------------------------------
 
     fn open_settings(&mut self) {
-        self.settings = Some(SettingsState {
-            section: SettingsSection::General,
-            in_content: false,
-            row: 0,
-        });
+        self.settings = Some(SettingsState { row: 0 });
     }
 
     fn settings_key(&mut self, key: KeyEvent) -> Action {
-        let Some(st) = self.settings.as_ref() else {
+        let Some(st) = self.settings.as_mut() else {
             return Action::None;
         };
-        let (section, in_content) = (st.section, st.in_content);
         match key.code {
-            KeyCode::Char('q') | KeyCode::Char(',') => {
-                self.settings = None;
-                return Action::None;
-            }
-            KeyCode::Char('?') | KeyCode::F(1) => {
-                self.show_help = true;
-                return Action::None;
-            }
-            _ => {}
-        }
-
-        if !in_content {
-            let st = self.settings.as_mut().unwrap();
-            match key.code {
-                KeyCode::Esc => self.settings = None,
-                KeyCode::Char('j') | KeyCode::Down => {
-                    st.section = match st.section {
-                        SettingsSection::General => SettingsSection::Servers,
-                        _ => SettingsSection::Databases,
-                    };
-                    st.row = 0;
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    st.section = match st.section {
-                        SettingsSection::Databases => SettingsSection::Servers,
-                        _ => SettingsSection::General,
-                    };
-                    st.row = 0;
-                }
-                KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter | KeyCode::Tab => {
-                    st.in_content = true;
-                }
-                _ => {}
-            }
-            return Action::None;
-        }
-
-        let len = match section {
-            SettingsSection::General => GENERAL_ROWS,
-            SettingsSection::Servers => self.cfg.servers.len(),
-            SettingsSection::Databases => self.cfg.databases.len(),
-        };
-        {
-            let st = self.settings.as_mut().unwrap();
-            match key.code {
-                KeyCode::Esc
-                | KeyCode::Char('h')
-                | KeyCode::Left
-                | KeyCode::Tab
-                | KeyCode::BackTab => {
-                    st.in_content = false;
-                    return Action::None;
-                }
-                KeyCode::Char('j') | KeyCode::Down => {
-                    st.row = (st.row + 1).min(len.saturating_sub(1));
-                    return Action::None;
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    st.row = st.row.saturating_sub(1);
-                    return Action::None;
-                }
-                _ => {}
-            }
-        }
-
-        let row = self.settings.as_ref().unwrap().row;
-        match section {
-            SettingsSection::General => {
-                if matches!(key.code, KeyCode::Char(' ') | KeyCode::Enter) {
-                    match row {
-                        0 => self.toggle_vim_mode(),
-                        1 => self.reset_layout(),
-                        _ => {}
-                    }
-                }
-            }
-            SettingsSection::Servers | SettingsSection::Databases => match key.code {
-                KeyCode::Char('a') => self.settings_add(section),
-                KeyCode::Char('e') | KeyCode::Enter => self.settings_edit(section, row),
-                KeyCode::Char('d') => self.settings_delete(section, row),
-                KeyCode::Char('t') => self.settings_test(section, row),
-                _ => {}
+            KeyCode::Char('q') | KeyCode::Char(',') | KeyCode::Esc => self.settings = None,
+            KeyCode::Char('?') | KeyCode::F(1) => self.show_help = true,
+            KeyCode::Char('j') | KeyCode::Down => st.row = (st.row + 1).min(GENERAL_ROWS - 1),
+            KeyCode::Char('k') | KeyCode::Up => st.row = st.row.saturating_sub(1),
+            KeyCode::Char(' ') | KeyCode::Enter => match st.row {
+                0 => self.toggle_vim_mode(),
+                _ => self.reset_layout(),
             },
+            _ => {}
         }
         Action::None
     }
@@ -1057,85 +1088,123 @@ impl App {
         }
     }
 
-    fn settings_add(&mut self, section: SettingsSection) {
-        self.form_token += 1;
-        let mut form = SourceForm::new_add();
-        if section == SettingsSection::Databases {
-            form.kind = SourceKind::Database;
+    // --- Managing connections ------------------------------------------------------
+
+    fn save_cfg(&mut self) {
+        if let Err(e) = config::save(&self.cfg) {
+            self.set_status(format!("✕ {e}"), StatusKind::Err);
         }
-        form.focus = FormField::Name;
-        self.form = Some(form);
     }
 
-    fn settings_edit(&mut self, section: SettingsSection, row: usize) {
-        let target = match section {
-            SettingsSection::Servers => self
-                .cfg
-                .servers
-                .get(row)
-                .map(|s| SourceTarget::Server(s.id.clone())),
-            SettingsSection::Databases => self
-                .cfg
-                .databases
-                .get(row)
-                .map(|d| SourceTarget::Database(d.id.clone())),
-            SettingsSection::General => None,
+    /// Fold a connection open or shut. Purely a display change — the databases
+    /// underneath are already known either way.
+    fn toggle_expand(&mut self, ci: usize) {
+        let Some(c) = self.cfg.connections.get(ci) else {
+            return;
         };
-        if let Some(target) = target {
-            self.open_edit_form_for(target);
+        let id = c.id.clone();
+        if self.cfg.quim.collapsed.contains(&id) {
+            self.cfg.quim.collapsed.retain(|other| other != &id);
+        } else {
+            self.cfg.quim.collapsed.push(id);
         }
+        self.save_cfg();
+        self.rebuild_entries();
     }
 
-    fn settings_delete(&mut self, section: SettingsSection, row: usize) {
-        match section {
-            SettingsSection::Servers => {
-                if let Some(s) = self.cfg.servers.get(row) {
-                    self.confirm = Some((
-                        format!("Delete server \"{}\" and all its databases? (y/n)", s.name),
-                        SourceTarget::Server(s.id.clone()),
-                    ));
-                }
-            }
-            SettingsSection::Databases => {
-                if let Some(d) = self.cfg.databases.get(row) {
-                    self.confirm = Some((
-                        format!("Delete database \"{}\"? (y/n)", d.name),
-                        SourceTarget::Database(d.id.clone()),
-                    ));
-                }
-            }
-            SettingsSection::General => {}
-        }
-    }
-
-    fn settings_test(&mut self, section: SettingsSection, row: usize) {
-        let (name, engine, conn, database) = match section {
-            SettingsSection::Servers => {
-                let Some(s) = self.cfg.servers.get(row) else {
-                    return;
-                };
-                (
-                    s.name.clone(),
-                    config::normalize_engine(&s.engine),
-                    s.connection_string.clone(),
-                    config::server_test_database(&s.engine),
-                )
-            }
-            SettingsSection::Databases => {
-                let Some(d) = self.cfg.databases.get(row) else {
-                    return;
-                };
-                let db =
-                    config::database_of_engine(&d.engine, &d.connection_string).unwrap_or_default();
-                (
-                    d.name.clone(),
-                    config::normalize_engine(&d.engine),
-                    d.connection_string.clone(),
-                    db,
-                )
-            }
-            SettingsSection::General => return,
+    /// Space on a database: show it under its connection, or stop showing it.
+    fn toggle_included(&mut self, entry_idx: usize) {
+        let Some(entry) = self.dbs.get(entry_idx).cloned() else {
+            return;
         };
+        let Some(ci) = self
+            .cfg
+            .connections
+            .iter()
+            .position(|c| c.id == entry.conn_id)
+        else {
+            return;
+        };
+        if self.cfg.connections[ci].is_single_database() {
+            self.set_status(
+                format!("{} is a single database", entry.conn_name),
+                StatusKind::Info,
+            );
+            return;
+        }
+        // Everything the connection currently shows, whether picked or not.
+        let known: Vec<String> = self
+            .dbs
+            .iter()
+            .filter(|d| d.conn_id == entry.conn_id)
+            .map(|d| d.database.clone())
+            .collect();
+        let c = &mut self.cfg.connections[ci];
+        let mut names: Vec<String> = match &c.databases {
+            DbSelection::All(_) => known.clone(),
+            DbSelection::Named(picked) => picked.clone(),
+        };
+        if names.contains(&entry.database) {
+            names.retain(|name| name != &entry.database);
+        } else {
+            names.push(entry.database.clone());
+            names.sort_by_key(|name| name.to_lowercase());
+        }
+        c.databases = if names.len() == known.len() {
+            DbSelection::all()
+        } else {
+            DbSelection::Named(names)
+        };
+        self.save_cfg();
+        self.rebuild_entries();
+    }
+
+    /// r on a connection: ask the host what databases it has and show them all.
+    /// Also the way back after hiding too many.
+    fn discover_databases(&mut self) {
+        let Some(ci) = self.selected_conn() else {
+            return;
+        };
+        let c = self.cfg.connections[ci].clone();
+        if !config::supports_listing(&c.engine()) {
+            self.set_status(
+                format!("{} is a single database file", c.name),
+                StatusKind::Info,
+            );
+            return;
+        }
+        self.cfg.connections[ci].databases = DbSelection::all();
+        self.cfg.quim.collapsed.retain(|id| id != &c.id);
+        self.save_cfg();
+        self.fetched.remove(&c.id);
+        self.request_databases(&c);
+        self.set_status(
+            format!("Listing databases on {}…", c.name),
+            StatusKind::Info,
+        );
+        self.rebuild_entries();
+    }
+
+    fn test_selected(&mut self) {
+        let Some(ci) = self.selected_conn() else {
+            return;
+        };
+        let c = &self.cfg.connections[ci];
+        let engine = c.engine();
+        if !config::supported_engine(&engine) {
+            self.set_status(
+                format!("✕ {}: unknown engine — set one with e", c.name),
+                StatusKind::Err,
+            );
+            return;
+        }
+        // Test the database under the cursor when there is one, so the check
+        // covers the same thing a query would.
+        let database = match self.selected_row() {
+            Some(SideRow::Db(i)) => self.dbs[i].database.clone(),
+            _ => config::probe_database(&engine, &c.connection_string),
+        };
+        let (name, conn) = (c.name.clone(), c.connection_string.clone());
         self.set_status(format!("Testing {name}…"), StatusKind::Info);
         let _ = self.req_tx.send(DbRequest::TestConnection {
             token: format!("@ping:{name}"),
@@ -1145,7 +1214,7 @@ impl App {
         });
     }
 
-    // --- Source form ---------------------------------------------------------------
+    // --- Connection form -------------------------------------------------------------
 
     fn open_add_form(&mut self) {
         self.form_token += 1;
@@ -1153,109 +1222,120 @@ impl App {
     }
 
     fn open_edit_form(&mut self) {
-        let Some(&idx) = self.filtered_dbs().get(self.db_list.sel) else {
+        let Some(ci) = self.selected_conn() else {
             return;
         };
-        let entry = self.dbs[idx].clone();
-        let Some((target, _)) = self.source_of(&entry) else {
-            return;
-        };
-        self.open_edit_form_for(target);
-    }
-
-    fn open_edit_form_for(&mut self, target: SourceTarget) {
-        self.form_token += 1;
-        let mut form = SourceForm::new_add();
-        form.focus = FormField::Name;
-        match target {
-            SourceTarget::Server(id) => {
-                let Some(s) = self.cfg.servers.iter().find(|s| s.id == id) else {
-                    return;
-                };
-                form.kind = SourceKind::Server;
-                form.engine = config::normalize_engine(&s.engine);
-                form.editing_id = Some(s.id.clone());
-                form.name = s.name.clone();
-                form.conn = s.connection_string.clone();
-                form.all_dbs = s.databases.is_all();
-                if let DbSelection::Named(names) = &s.databases {
-                    form.db_list = names.iter().map(|n| (n.clone(), true)).collect();
-                }
-            }
-            SourceTarget::Database(id) => {
-                let Some(d) = self.cfg.databases.iter().find(|d| d.id == id) else {
-                    return;
-                };
-                form.kind = SourceKind::Database;
-                form.engine = config::normalize_engine(&d.engine);
-                form.editing_id = Some(d.id.clone());
-                form.name = d.name.clone();
-                form.conn = d.connection_string.clone();
-            }
-        }
-        form.cursor = form.name.chars().count();
-        self.form = Some(form);
-    }
-
-    /// The config source behind a database entry, plus a human label for it.
-    fn source_of(&self, entry: &DbEntry) -> Option<(SourceTarget, String)> {
-        if let Some(rest) = entry.id.strip_prefix("s:") {
-            let srv_id = rest.split_once(':').map(|(id, _)| id)?;
-            let name = self
-                .cfg
-                .servers
-                .iter()
-                .find(|s| s.id == srv_id)
-                .map(|s| s.name.clone())
-                .unwrap_or_else(|| srv_id.to_string());
-            Some((
-                SourceTarget::Server(srv_id.to_string()),
-                format!("server \"{name}\""),
-            ))
-        } else if let Some(id) = entry.id.strip_prefix("d:") {
-            Some((
-                SourceTarget::Database(id.to_string()),
-                format!("database \"{}\"", entry.name),
-            ))
+        let c = self.cfg.connections[ci].clone();
+        let engine = c.engine();
+        // Show the scope the connection actually has. Anything the string
+        // already implies stays on auto, so a rename saves as a no-op.
+        let scope = if c.databases == config::selection_for(&engine, &c.connection_string) {
+            FormScope::Auto
+        } else if c.databases.is_all() {
+            FormScope::All
         } else {
-            None
+            FormScope::Pick
+        };
+        self.form_token += 1;
+        self.form = Some(SourceForm {
+            editing_id: Some(c.id),
+            cursor: c.name.chars().count(),
+            name: c.name,
+            conn: c.connection_string,
+            engine_override: c.engine,
+            scope,
+            db_list: c
+                .databases
+                .names()
+                .iter()
+                .map(|name| (name.clone(), true))
+                .collect(),
+            ..SourceForm::new_add()
+        });
+        // Opening on Pick means the saved list is a subset — go and get the
+        // rest, so the ones hidden earlier can be ticked back on.
+        if scope == FormScope::Pick {
+            self.form_fetch();
         }
     }
 
+    /// d asks about whatever the cursor is on: on a database that means hiding
+    /// it, on a connection it means throwing the connection string away.
     fn open_confirm_delete(&mut self) {
-        let Some(&idx) = self.filtered_dbs().get(self.db_list.sel) else {
+        if let Some(SideRow::Db(i)) = self.selected_row() {
+            let Some(entry) = self.dbs.get(i).cloned() else {
+                return;
+            };
+            let one_row = self
+                .cfg
+                .connections
+                .iter()
+                .find(|c| c.id == entry.conn_id)
+                .is_some_and(|c| c.is_single_database());
+            // A connection that is one database has nothing to hide — d there
+            // means the connection itself.
+            if !one_row {
+                if !entry.included {
+                    self.set_status(
+                        format!("{} is already hidden — Enter shows it again", entry.name),
+                        StatusKind::Info,
+                    );
+                    return;
+                }
+                self.confirm = Some((
+                    format!(
+                        "Hide \"{}\" from {}? (y/n)",
+                        entry.database, entry.conn_name
+                    ),
+                    ConfirmAction::HideDatabase {
+                        conn_id: entry.conn_id,
+                        database: entry.database,
+                    },
+                ));
+                return;
+            }
+        }
+        let Some(ci) = self.selected_conn() else {
             return;
         };
-        let entry = self.dbs[idx].clone();
-        if let Some((target, label)) = self.source_of(&entry) {
-            let note = match &target {
-                SourceTarget::Server(_) => " and all its databases",
-                SourceTarget::Database(_) => "",
-            };
-            self.confirm = Some((format!("Delete {label}{note}? (y/n)"), target));
-        }
+        let c = &self.cfg.connections[ci];
+        let note = if c.is_single_database() {
+            ""
+        } else {
+            " and all its databases"
+        };
+        self.confirm = Some((
+            format!("Delete connection \"{}\"{note}? (y/n)", c.name),
+            ConfirmAction::DeleteConnection(c.id.clone()),
+        ));
     }
 
     fn confirm_key(&mut self, key: KeyEvent) -> Action {
-        let Some((_, target)) = self.confirm.take() else {
+        let Some((_, action)) = self.confirm.take() else {
             return Action::None;
         };
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                match &target {
-                    SourceTarget::Server(id) => {
-                        self.cfg.servers.retain(|s| &s.id != id);
-                        self.server_dbs.remove(id);
-                    }
-                    SourceTarget::Database(id) => self.cfg.databases.retain(|d| &d.id != id),
-                }
-                match config::save(&self.cfg) {
-                    Ok(()) => self.set_status("Source deleted".into(), StatusKind::Ok),
-                    Err(e) => self.set_status(format!("✕ {e}"), StatusKind::Err),
-                }
+        if !matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+            return Action::None;
+        }
+        match action {
+            ConfirmAction::DeleteConnection(id) => {
+                self.cfg.connections.retain(|c| c.id != id);
+                self.cfg.quim.collapsed.retain(|other| other != &id);
+                self.fetched.remove(&id);
+                self.save_cfg();
+                self.set_status("Connection deleted".into(), StatusKind::Ok);
                 self.rebuild_entries();
             }
-            _ => {}
+            ConfirmAction::HideDatabase { conn_id, database } => {
+                let found = self
+                    .dbs
+                    .iter()
+                    .position(|d| d.conn_id == conn_id && d.database == database);
+                if let Some(i) = found {
+                    self.toggle_included(i);
+                    self.set_status(format!("{database} hidden"), StatusKind::Ok);
+                }
+            }
         }
         Action::None
     }
@@ -1336,38 +1416,28 @@ impl App {
                 }
                 _ => {}
             },
-            FormField::Kind => match key.code {
-                KeyCode::Char('h')
-                | KeyCode::Char('l')
-                | KeyCode::Char(' ')
-                | KeyCode::Left
-                | KeyCode::Right
-                | KeyCode::Enter => {
-                    if form.kind == SourceKind::Server {
-                        form.kind = SourceKind::Database;
-                    } else if config::supports_server_sources(&form.engine) {
-                        form.kind = SourceKind::Server;
-                    }
-                }
-                KeyCode::Up => form.move_focus(-1),
-                KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k') => form.move_focus(1),
-                _ => {}
-            },
+            // Enter keeps meaning "next field" here — the engine is normally
+            // left on auto, so Space/h/l are what change it.
             FormField::Engine => match key.code {
-                KeyCode::Char('h')
-                | KeyCode::Char('l')
-                | KeyCode::Char(' ')
-                | KeyCode::Left
-                | KeyCode::Right
-                | KeyCode::Enter => form.cycle_engine(),
+                KeyCode::Char('l') | KeyCode::Char(' ') | KeyCode::Right => form.cycle_engine(1),
+                KeyCode::Char('h') | KeyCode::Left => form.cycle_engine(-1),
+                KeyCode::Enter => form.move_focus(1),
                 KeyCode::Up | KeyCode::Char('k') => form.move_focus(-1),
                 KeyCode::Down | KeyCode::Char('j') => form.move_focus(1),
                 _ => {}
             },
-            FormField::AllToggle => match key.code {
-                KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Char('h') | KeyCode::Char('l') => {
-                    form.all_dbs = !form.all_dbs;
+            FormField::Scope => match key.code {
+                KeyCode::Char('l') | KeyCode::Char(' ') | KeyCode::Right => {
+                    if form.cycle_scope(1) {
+                        self.form_fetch();
+                    }
                 }
+                KeyCode::Char('h') | KeyCode::Left => {
+                    if form.cycle_scope(-1) {
+                        self.form_fetch();
+                    }
+                }
+                KeyCode::Enter => form.move_focus(1),
                 KeyCode::Up | KeyCode::Char('k') => form.move_focus(-1),
                 KeyCode::Down | KeyCode::Char('j') => form.move_focus(1),
                 _ => {}
@@ -1378,6 +1448,7 @@ impl App {
                         item.1 = !item.1;
                     }
                 }
+                // a flips the whole list, for "none of these except…".
                 KeyCode::Char('a') => {
                     let all_on = form.db_list.iter().all(|(_, on)| *on);
                     for item in &mut form.db_list {
@@ -1387,13 +1458,11 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => {
                     form.list_sel = (form.list_sel + 1).min(form.db_list.len().saturating_sub(1));
                 }
-                KeyCode::Up | KeyCode::Char('k') => form.list_sel = form.list_sel.saturating_sub(1),
-                _ => {}
-            },
-            FormField::Fetch => match key.code {
-                KeyCode::Enter | KeyCode::Char(' ') => self.form_fetch(),
+                KeyCode::Up | KeyCode::Char('k') if form.list_sel > 0 => {
+                    form.list_sel -= 1;
+                }
+                // Off the top of the list steps back to the scope row.
                 KeyCode::Up | KeyCode::Char('k') => form.move_focus(-1),
-                KeyCode::Down | KeyCode::Char('j') => form.move_focus(1),
                 _ => {}
             },
             FormField::Save => match key.code {
@@ -1418,32 +1487,33 @@ impl App {
         Action::None
     }
 
+    /// Ask the host what databases it has, so the picker shows the live list
+    /// rather than only the ones already saved.
     fn form_fetch(&mut self) {
         let token = self.form_token;
         let Some(form) = self.form.as_mut() else {
             return;
         };
+        let engine = form.engine();
         if form.conn.trim().is_empty() {
             form.error = Some("Enter a connection string first".into());
             return;
         }
-        if !config::supports_server_sources(&form.engine) {
-            form.error =
-                Some("SQLite is a single database file; add it as a database source.".into());
+        if !config::supports_listing(&engine) {
             return;
         }
         form.error = None;
         form.fetching = true;
         let _ = self.req_tx.send(DbRequest::ListDatabases {
-            server_id: format!("@form:{token}"),
-            engine: config::normalize_engine(&form.engine),
+            conn_id: format!("@form:{token}"),
+            engine,
             conn: form.conn.trim().to_string(),
         });
     }
 
-    fn on_form_fetch(&mut self, server_id: String, result: Result<Vec<String>, String>) {
-        if server_id != format!("@form:{}", self.form_token) {
-            return; // stale response from a closed form
+    fn on_form_fetch(&mut self, conn_id: String, result: Result<Vec<String>, String>) {
+        if conn_id != format!("@form:{}", self.form_token) {
+            return; // stale response from a form that has since closed
         }
         let Some(form) = self.form.as_mut() else {
             return;
@@ -1451,18 +1521,25 @@ impl App {
         form.fetching = false;
         match result {
             Ok(names) => {
-                let previously: HashMap<String, bool> = form.db_list.drain(..).collect();
+                // Keep the ticks already made; if nothing was picked yet, the
+                // whole host is the sensible starting point.
+                let picked: HashMap<String, bool> = form.db_list.drain(..).collect();
+                let start_on = picked.is_empty();
                 form.db_list = names
                     .into_iter()
-                    .map(|n| {
-                        let on = previously.get(&n).copied().unwrap_or(previously.is_empty());
-                        (n, on)
+                    .map(|name| {
+                        let on = picked.get(&name).copied().unwrap_or(start_on);
+                        (name, on)
                     })
                     .collect();
                 form.list_sel = 0;
+                form.fetched = true;
                 form.error = None;
             }
-            Err(e) => form.error = Some(e),
+            Err(e) => {
+                form.error = Some(e);
+                form.scope = FormScope::Auto;
+            }
         }
     }
 
@@ -1481,45 +1558,36 @@ impl App {
             form.error = Some("Connection string is required".into());
             return;
         }
-        form.engine = config::normalize_engine(&form.engine);
-        if !config::supported_engine(&form.engine) {
-            form.error = Some(format!("Engine \"{}\" is not supported", form.engine));
+        let engine = form.engine();
+        if !config::supported_engine(&engine) {
+            form.error = Some("Could not tell which engine this is — pick one".into());
+            form.focus = FormField::Engine;
             return;
         }
-        if form.kind == SourceKind::Server && !config::supports_server_sources(&form.engine) {
-            form.error =
-                Some("SQLite is a single database file; add it as a database source.".into());
-            return;
-        }
-        if form.kind == SourceKind::Server
-            && !form.all_dbs
-            && !form.db_list.iter().any(|(_, on)| *on)
-        {
-            form.error = Some("Select at least one database, or use all".into());
+        if form.scope == FormScope::Pick && form.picked().is_empty() {
+            form.error = Some("Tick at least one database, or switch to all".into());
+            form.focus = FormField::Scope;
             return;
         }
         form.error = None;
         form.saving = true;
-        let database = match form.kind {
-            SourceKind::Server => config::server_test_database(&form.engine),
-            SourceKind::Database => {
-                config::database_of_engine(&form.engine, &form.conn).unwrap_or_default()
-            }
-        };
+        let database = config::probe_database(&engine, &form.conn);
         let _ = self.req_tx.send(DbRequest::TestConnection {
             token: format!("@save:{token}"),
-            engine: form.engine.clone(),
+            engine,
             conn: form.conn.clone(),
             database,
         });
     }
 
     fn on_test_result(&mut self, token: String, result: Result<(), String>) {
-        // Standalone connection test from the settings screen (t on a source).
+        // Standalone test of the connection under the cursor (t in the sidebar).
         if let Some(name) = token.strip_prefix("@ping:") {
             match result {
-                Ok(()) => self.set_status(format!("✓ {name}: connection ok"), StatusKind::Ok),
-                Err(e) => self.set_status(format!("✕ {name}: {e}"), StatusKind::Err),
+                Ok(()) => {
+                    self.set_status(format!("\u{2713} {name}: connection ok"), StatusKind::Ok)
+                }
+                Err(e) => self.set_status(format!("\u{2715} {name}: {e}"), StatusKind::Err),
             }
             return;
         }
@@ -1540,91 +1608,49 @@ impl App {
         let Some(form) = self.form.clone() else {
             return;
         };
-        let engine = config::normalize_engine(&form.engine);
-        match form.kind {
-            SourceKind::Server => {
-                let id = form
-                    .editing_id
-                    .clone()
-                    .unwrap_or_else(|| config::new_id("srv"));
-                let databases = if form.all_dbs {
-                    DbSelection::all()
-                } else {
-                    DbSelection::Named(
-                        form.db_list
-                            .iter()
-                            .filter(|(_, on)| *on)
-                            .map(|(n, _)| n.clone())
-                            .collect(),
-                    )
-                };
-                let extra = self
-                    .cfg
-                    .servers
-                    .iter()
-                    .find(|s| s.id == id)
-                    .map(|s| s.extra.clone())
-                    .unwrap_or_default();
-                let entry = ServerCfg {
-                    id: id.clone(),
-                    name: form.name.clone(),
-                    engine: engine.clone(),
-                    connection_string: form.conn.clone(),
-                    databases,
-                    extra,
-                };
-                match self.cfg.servers.iter().position(|s| s.id == id) {
-                    Some(i) => self.cfg.servers[i] = entry,
-                    None => self.cfg.servers.push(entry),
-                }
-                if let Err(e) = config::save(&self.cfg) {
-                    if let Some(f) = self.form.as_mut() {
-                        f.error = Some(e);
-                    }
-                    return;
-                }
-                self.form = None;
-                if form.all_dbs {
-                    self.server_dbs.remove(&id);
-                    self.pending_servers += 1;
-                    let _ = self.req_tx.send(DbRequest::ListDatabases {
-                        server_id: id,
-                        engine,
-                        conn: form.conn.clone(),
-                    });
-                }
+        let id = form
+            .editing_id
+            .clone()
+            .unwrap_or_else(|| config::new_id("conn"));
+        let engine = form.engine();
+        let existing = self.cfg.connections.iter().position(|c| c.id == id);
+        let extra = existing
+            .map(|i| self.cfg.connections[i].extra.clone())
+            .unwrap_or_default();
+        let databases = match form.scope {
+            FormScope::All => DbSelection::all(),
+            FormScope::Pick => DbSelection::Named(form.picked()),
+            // Auto follows the connection string — except on an edit that left
+            // the string alone, where it means "don't touch what I picked in
+            // the sidebar".
+            FormScope::Auto => match existing.map(|i| &self.cfg.connections[i]) {
+                Some(c) if c.connection_string == form.conn => c.databases.clone(),
+                _ => config::selection_for(&engine, &form.conn),
+            },
+        };
+        let entry = ConnectionCfg {
+            id: id.clone(),
+            name: form.name.clone(),
+            engine: form.engine_override.clone(),
+            connection_string: form.conn.clone(),
+            databases,
+            extra,
+        };
+        let lists_everything = entry.databases.is_all() && config::supports_listing(&engine);
+        match existing {
+            Some(i) => self.cfg.connections[i] = entry.clone(),
+            None => self.cfg.connections.push(entry.clone()),
+        }
+        if let Err(e) = config::save(&self.cfg) {
+            if let Some(f) = self.form.as_mut() {
+                f.error = Some(e);
             }
-            SourceKind::Database => {
-                let id = form
-                    .editing_id
-                    .clone()
-                    .unwrap_or_else(|| config::new_id("db"));
-                let extra = self
-                    .cfg
-                    .databases
-                    .iter()
-                    .find(|d| d.id == id)
-                    .map(|d| d.extra.clone())
-                    .unwrap_or_default();
-                let entry = DatabaseCfg {
-                    id: id.clone(),
-                    name: form.name.clone(),
-                    engine,
-                    connection_string: form.conn.clone(),
-                    extra,
-                };
-                match self.cfg.databases.iter().position(|d| d.id == id) {
-                    Some(i) => self.cfg.databases[i] = entry,
-                    None => self.cfg.databases.push(entry),
-                }
-                if let Err(e) = config::save(&self.cfg) {
-                    if let Some(f) = self.form.as_mut() {
-                        f.error = Some(e);
-                    }
-                    return;
-                }
-                self.form = None;
-            }
+            return;
+        }
+        self.form = None;
+        if lists_everything {
+            self.fetched.remove(&id);
+            self.request_databases(&entry);
         }
         self.set_status(format!("Saved {}", form.name), StatusKind::Ok);
         self.rebuild_entries();
@@ -1632,8 +1658,11 @@ impl App {
 
     // --- Pane keys -------------------------------------------------------------
 
+    /// The sidebar is where connections are managed: a/e/d/t act on the
+    /// connection under the cursor, h/l fold it, Space picks databases.
     fn db_list_key(&mut self, key: KeyEvent, pending_g: bool) -> Action {
-        if !self.db_list.typing {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if !self.db_list.typing && !ctrl {
             match key.code {
                 KeyCode::Char('a') => {
                     self.open_add_form();
@@ -1643,14 +1672,42 @@ impl App {
                     self.open_edit_form();
                     return Action::None;
                 }
-                KeyCode::Char('d') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                KeyCode::Char('d') => {
                     self.open_confirm_delete();
+                    return Action::None;
+                }
+                KeyCode::Char('t') => {
+                    self.test_selected();
+                    return Action::None;
+                }
+                KeyCode::Char('r') => {
+                    self.discover_databases();
+                    return Action::None;
+                }
+                KeyCode::Char(' ') => {
+                    match self.selected_row() {
+                        Some(SideRow::Conn(ci)) => self.toggle_expand(ci),
+                        Some(SideRow::Db(i)) => self.toggle_included(i),
+                        None => {}
+                    }
+                    return Action::None;
+                }
+                KeyCode::Char('l') | KeyCode::Right => {
+                    if let Some(SideRow::Conn(ci)) = self.selected_row() {
+                        if self.is_collapsed(ci) {
+                            self.toggle_expand(ci);
+                        }
+                    }
+                    return Action::None;
+                }
+                KeyCode::Char('h') | KeyCode::Left => {
+                    self.collapse_or_go_to_parent();
                     return Action::None;
                 }
                 _ => {}
             }
         }
-        let len = self.filtered_dbs().len();
+        let len = self.visible_rows().len();
         if let Some(action) = list_common(
             &mut self.db_list,
             len,
@@ -1665,14 +1722,59 @@ impl App {
             // A single Enter both confirms an active filter and selects the
             // highlighted db — no need to press it twice.
             self.db_list.typing = false;
-            if let Some(&idx) = self.filtered_dbs().get(self.db_list.sel) {
-                let entry = self.dbs[idx].clone();
-                if self.active.as_ref().map(|a| a.id.as_str()) != Some(entry.id.as_str()) {
-                    self.select_db(entry);
-                }
+            match self.selected_row() {
+                Some(SideRow::Conn(ci)) => self.toggle_expand(ci),
+                Some(SideRow::Db(i)) => self.activate(i),
+                None => {}
             }
         }
         Action::None
+    }
+
+    fn is_collapsed(&self, ci: usize) -> bool {
+        self.cfg
+            .connections
+            .get(ci)
+            .is_some_and(|c| self.cfg.quim.collapsed.contains(&c.id))
+    }
+
+    /// h folds the connection shut; on one of its databases it jumps up to the
+    /// connection first, the way a file tree does.
+    fn collapse_or_go_to_parent(&mut self) {
+        match self.selected_row() {
+            Some(SideRow::Conn(ci)) => {
+                if !self.is_collapsed(ci) {
+                    self.toggle_expand(ci);
+                }
+            }
+            Some(SideRow::Db(i)) => {
+                let Some(conn_id) = self.dbs.get(i).map(|d| d.conn_id.clone()) else {
+                    return;
+                };
+                let parent = self.visible_rows().iter().position(|row| {
+                    matches!(row, SideRow::Conn(ci)
+                        if self.cfg.connections[*ci].id == conn_id)
+                });
+                if let Some(sel) = parent {
+                    self.db_list.sel = sel;
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Point queries at this database. Picking one the connection hides brings
+    /// it back rather than doing nothing.
+    fn activate(&mut self, entry_idx: usize) {
+        let Some(entry) = self.dbs.get(entry_idx).cloned() else {
+            return;
+        };
+        if !entry.included {
+            self.toggle_included(entry_idx);
+        }
+        if self.active.as_ref().map(|a| a.id.as_str()) != Some(entry.id.as_str()) {
+            self.select_db(entry);
+        }
     }
 
     fn tbl_list_key(&mut self, key: KeyEvent, pending_g: bool) -> Action {
@@ -2294,6 +2396,379 @@ fn compute_widths(cols: &[ColMeta], rows: &[Vec<Option<String>>]) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc::Receiver;
+
+    type ScratchConfig = std::sync::MutexGuard<'static, ()>;
+
+    fn connection(id: &str, name: &str, conn: &str) -> ConnectionCfg {
+        ConnectionCfg {
+            id: id.into(),
+            name: name.into(),
+            engine: None,
+            databases: config::selection_for(
+                &config::detect_engine(conn).unwrap_or_default(),
+                conn,
+            ),
+            connection_string: conn.into(),
+            extra: Default::default(),
+        }
+    }
+
+    /// An app with one MSSQL host (which has reported three databases), one
+    /// Postgres connection pointing at a single database, and one SQLite file.
+    /// The third element is the scratch-config guard — keep it alive.
+    fn app_with_tree() -> (App, Receiver<DbRequest>, ScratchConfig) {
+        let scratch = config::use_scratch_config_dir();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cfg = Config {
+            connections: vec![
+                connection(
+                    "conn_sql",
+                    "Local server",
+                    "Server=localhost,1433;User Id=sa",
+                ),
+                connection(
+                    "conn_pg",
+                    "platform",
+                    "postgres://u:p@127.0.0.1:15433/gbandit",
+                ),
+                connection("conn_lite", "Cursor sqlite", "/tmp/store.db"),
+            ],
+            ..Default::default()
+        };
+        let mut app = App::new(cfg, tx);
+        app.on_db_response(DbResponse::Databases {
+            conn_id: "conn_sql".into(),
+            result: Ok(vec!["master".into(), "AppDb".into(), "Reporting".into()]),
+        });
+        (app, rx, scratch)
+    }
+
+    /// The tree as "kind:label" lines, which is what the sidebar draws.
+    fn rendered(app: &App) -> Vec<String> {
+        app.visible_rows()
+            .iter()
+            .map(|row| match row {
+                SideRow::Conn(ci) => format!("conn:{}", app.cfg.connections[*ci].name),
+                SideRow::Db(i) => format!(
+                    "db:{}{}",
+                    app.dbs[*i].name,
+                    if app.dbs[*i].included {
+                        ""
+                    } else {
+                        " (hidden)"
+                    }
+                ),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_host_gets_children_and_a_single_database_gets_one_row() {
+        let (app, _rx, _cfg) = app_with_tree();
+        assert_eq!(
+            rendered(&app),
+            [
+                "conn:Local server",
+                "db:AppDb",
+                "db:master",
+                "db:Reporting",
+                // Both of these name one database, so they are a row each
+                // rather than a connection to unfold.
+                "db:platform",
+                "db:Cursor sqlite",
+            ]
+        );
+    }
+
+    #[test]
+    fn collapsing_hides_the_children_but_keeps_them_selectable() {
+        let (mut app, _rx, _cfg) = app_with_tree();
+        app.toggle_expand(0);
+        assert_eq!(
+            rendered(&app),
+            ["conn:Local server", "db:platform", "db:Cursor sqlite"]
+        );
+        // Still known, so the filter and the remembered selection find them.
+        assert!(app.dbs.iter().any(|d| d.name == "Reporting"));
+
+        app.toggle_expand(0);
+        assert_eq!(rendered(&app).len(), 6);
+    }
+
+    #[test]
+    fn filtering_flattens_the_tree_to_the_matches() {
+        let (mut app, _rx, _cfg) = app_with_tree();
+        app.db_list.filter = "re".into();
+        assert_eq!(rendered(&app), ["db:Reporting"]);
+        app.db_list.filter.clear();
+        assert_eq!(rendered(&app).len(), 6);
+    }
+
+    #[test]
+    fn space_stops_listing_a_database_and_enter_brings_it_back() {
+        let (mut app, _rx, _cfg) = app_with_tree();
+        let reporting = app.dbs.iter().position(|d| d.name == "Reporting").unwrap();
+        app.toggle_included(reporting);
+
+        assert_eq!(
+            app.cfg.connections[0].databases.names(),
+            ["AppDb", "master"]
+        );
+        // It stays on screen, dimmed, so it can be picked straight back up.
+        assert!(rendered(&app).contains(&"db:Reporting (hidden)".to_string()));
+        // ...but it is out of the filter, which only offers what is listed.
+        app.db_list.filter = "report".into();
+        assert!(rendered(&app).is_empty());
+        app.db_list.filter.clear();
+
+        let reporting = app.dbs.iter().position(|d| d.name == "Reporting").unwrap();
+        app.activate(reporting);
+        assert!(app.cfg.connections[0].databases.is_all());
+        assert_eq!(
+            app.active.as_ref().map(|a| a.database.as_str()),
+            Some("Reporting")
+        );
+    }
+
+    #[test]
+    fn discover_widens_a_single_database_connection_to_its_host() {
+        let (mut app, rx, _cfg) = app_with_tree();
+        while rx.try_recv().is_ok() {} // drain the startup listing
+        let platform = app.dbs.iter().position(|d| d.name == "platform").unwrap();
+        let row = app
+            .visible_rows()
+            .iter()
+            .position(|r| *r == SideRow::Db(platform))
+            .unwrap();
+        app.db_list.sel = row;
+        app.discover_databases();
+
+        assert!(app.cfg.connections[1].databases.is_all());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(DbRequest::ListDatabases { conn_id, .. }) if conn_id == "conn_pg"
+        ));
+        app.on_db_response(DbResponse::Databases {
+            conn_id: "conn_pg".into(),
+            result: Ok(vec!["gbandit".into(), "postgres".into()]),
+        });
+        // No longer a leaf: it unfolds into the databases on that host.
+        let rows = rendered(&app);
+        assert!(rows.contains(&"conn:platform".to_string()));
+        assert!(rows.contains(&"db:postgres".to_string()));
+    }
+
+    /// Hiding a host down to its last database must not turn it into a leaf —
+    /// the hidden ones would go with it and there would be no way back short
+    /// of r.
+    #[test]
+    fn hiding_all_but_one_database_keeps_the_host_a_host() {
+        let (mut app, _rx, _cfg) = app_with_tree();
+        for name in ["Reporting", "master"] {
+            let i = app.dbs.iter().position(|d| d.name == name).unwrap();
+            app.toggle_included(i);
+        }
+        assert_eq!(app.cfg.connections[0].databases.names(), ["AppDb"]);
+        assert_eq!(
+            rendered(&app),
+            [
+                "conn:Local server",
+                "db:AppDb",
+                "db:master (hidden)",
+                "db:Reporting (hidden)",
+                "db:platform",
+                "db:Cursor sqlite",
+            ]
+        );
+    }
+
+    /// d is delete on a connection but only hide on one of its databases —
+    /// the two sit next to each other, so they must not do the same thing.
+    #[test]
+    fn d_on_a_database_offers_to_hide_it_not_to_delete_the_connection() {
+        let (mut app, _rx, _cfg) = app_with_tree();
+        let master = app.dbs.iter().position(|d| d.name == "master").unwrap();
+        app.db_list.sel = app
+            .visible_rows()
+            .iter()
+            .position(|r| *r == SideRow::Db(master))
+            .unwrap();
+
+        app.open_confirm_delete();
+        let (prompt, action) = app.confirm.clone().unwrap();
+        assert!(prompt.contains("Hide \"master\" from Local server"));
+        assert!(!action.is_delete());
+
+        app.confirm_key(KeyEvent::from(KeyCode::Char('y')));
+        assert_eq!(app.cfg.connections.len(), 3, "connection must survive");
+        assert_eq!(
+            app.cfg.connections[0].databases.names(),
+            ["AppDb", "Reporting"]
+        );
+
+        // On the connection row it still means the connection.
+        app.db_list.sel = 0;
+        app.open_confirm_delete();
+        let (prompt, action) = app.confirm.clone().unwrap();
+        assert!(prompt.contains("Delete connection \"Local server\""));
+        assert!(action.is_delete());
+        app.confirm_key(KeyEvent::from(KeyCode::Char('y')));
+        assert_eq!(app.cfg.connections.len(), 2);
+    }
+
+    #[test]
+    fn n_at_the_prompt_leaves_everything_alone() {
+        let (mut app, _rx, _cfg) = app_with_tree();
+        app.db_list.sel = 0;
+        app.open_confirm_delete();
+        app.confirm_key(KeyEvent::from(KeyCode::Char('n')));
+        assert!(app.confirm.is_none());
+        assert_eq!(app.cfg.connections.len(), 3);
+    }
+
+    /// The picker is the durable way to change the set: it fetches the live
+    /// list, so databases hidden in an earlier session are ticked back on here.
+    #[test]
+    fn editing_a_narrowed_connection_opens_the_picker_on_the_full_list() {
+        let (mut app, rx, _cfg) = app_with_tree();
+        while rx.try_recv().is_ok() {}
+        let master = app.dbs.iter().position(|d| d.name == "master").unwrap();
+        app.toggle_included(master);
+
+        app.db_list.sel = 0; // the connection row
+        app.open_edit_form();
+        let form = app.form.as_ref().unwrap();
+        assert!(form.scope == FormScope::Pick);
+        assert!(form.fetching);
+        // Only the saved names are known until the host answers.
+        assert_eq!(
+            form.db_list,
+            [("AppDb".into(), true), ("Reporting".into(), true)]
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(DbRequest::ListDatabases { conn_id, .. }) if conn_id.starts_with("@form:")
+        ));
+
+        app.on_db_response(DbResponse::Databases {
+            conn_id: format!("@form:{}", app.form_token),
+            result: Ok(vec!["AppDb".into(), "master".into(), "Reporting".into()]),
+        });
+        let form = app.form.as_mut().unwrap();
+        assert!(!form.fetching);
+        // The hidden one is back on the list, unticked and ready to tick.
+        assert_eq!(
+            form.db_list,
+            [
+                ("AppDb".into(), true),
+                ("master".into(), false),
+                ("Reporting".into(), true)
+            ]
+        );
+
+        form.db_list[1].1 = true;
+        app.form_save();
+        app.on_test_result(format!("@save:{}", app.form_token), Ok(()));
+        assert_eq!(
+            app.cfg.connections[0].databases.names(),
+            ["AppDb", "master", "Reporting"]
+        );
+    }
+
+    #[test]
+    fn the_picker_refuses_to_save_an_empty_selection() {
+        let (mut app, _rx, _cfg) = app_with_tree();
+        app.db_list.sel = 0;
+        app.open_edit_form();
+        let form = app.form.as_mut().unwrap();
+        form.scope = FormScope::Pick;
+        form.db_list = vec![("AppDb".into(), false)];
+        app.form_save();
+        let form = app.form.as_ref().expect("form stays open");
+        assert!(form.error.as_deref().unwrap().contains("at least one"));
+        assert!(!form.saving);
+    }
+
+    /// Typing a name and a string is the whole form; everything else follows.
+    #[test]
+    fn adding_a_connection_derives_its_engine_and_scope() {
+        let (mut app, rx, _cfg) = app_with_tree();
+        while rx.try_recv().is_ok() {}
+        app.open_add_form();
+        let form = app.form.as_mut().unwrap();
+        form.name = "warehouse".into();
+        form.conn = "postgres://u:p@dw:5432/".into();
+        app.form_save();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(DbRequest::TestConnection { engine, .. }) if engine == "postgres"
+        ));
+        app.on_test_result(format!("@save:{}", app.form_token), Ok(()));
+
+        assert!(app.form.is_none());
+        let added = app.cfg.connections.last().unwrap();
+        assert_eq!(added.name, "warehouse");
+        assert_eq!(added.engine, None); // derived, so nothing to write down
+                                        // No database in the URL, so it is a host and gets listed.
+        assert!(added.databases.is_all());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(DbRequest::ListDatabases { conn_id, .. }) if conn_id == added.id
+        ));
+    }
+
+    #[test]
+    fn editing_from_a_child_row_edits_its_connection() {
+        let (mut app, _rx, _cfg) = app_with_tree();
+        let appdb = app.dbs.iter().position(|d| d.name == "AppDb").unwrap();
+        app.db_list.sel = app
+            .visible_rows()
+            .iter()
+            .position(|r| *r == SideRow::Db(appdb))
+            .unwrap();
+        app.open_edit_form();
+        let form = app.form.as_ref().unwrap();
+        assert_eq!(form.editing_id.as_deref(), Some("conn_sql"));
+        assert_eq!(form.name, "Local server");
+    }
+
+    /// Renaming must not throw away databases picked in the sidebar.
+    #[test]
+    fn editing_without_touching_the_string_keeps_the_picked_databases() {
+        let (mut app, _rx, _cfg) = app_with_tree();
+        let reporting = app.dbs.iter().position(|d| d.name == "Reporting").unwrap();
+        app.toggle_included(reporting);
+        let picked = app.cfg.connections[0].databases.names().to_vec();
+
+        app.db_list.sel = 0; // the connection row
+        app.open_edit_form();
+        app.form.as_mut().unwrap().name = "prod-sql".into();
+        app.form_save();
+        app.on_test_result(format!("@save:{}", app.form_token), Ok(()));
+
+        assert_eq!(app.cfg.connections[0].name, "prod-sql");
+        assert_eq!(app.cfg.connections[0].databases.names(), picked.as_slice());
+    }
+
+    #[test]
+    fn sqlite_has_nothing_to_discover() {
+        let (mut app, _rx, _cfg) = app_with_tree();
+        let lite = app
+            .dbs
+            .iter()
+            .position(|d| d.name == "Cursor sqlite")
+            .unwrap();
+        let row = app
+            .visible_rows()
+            .iter()
+            .position(|r| *r == SideRow::Db(lite))
+            .unwrap();
+        app.db_list.sel = row;
+        app.discover_databases();
+        assert!(app.cfg.connections[2].databases.names() == ["main"]);
+        assert_eq!(rendered(&app).len(), 6);
+    }
 
     fn view_with(rows: Vec<Vec<Option<&str>>>) -> QueryView {
         let cols = vec![

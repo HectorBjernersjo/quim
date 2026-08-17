@@ -40,7 +40,11 @@ quim --check                   # test config + connection + schema headlessly
 | `Ctrl+W`, then `h/j/k/l` | resize the focused pane (`h/l` width, `j/k` height); saved to config |
 | `j/k`, `gg`/`G`, `Ctrl+D/U` | navigate lists and results |
 | `/` | filter databases/tables (`Esc` clears) |
-| `a` / `e` / `d` | add / edit / delete a source (in the database list) |
+| `a` / `e` / `t` | add / edit / test a connection (in the sidebar) |
+| `d` | on a database: hide it · on a connection: delete it |
+| `h` / `l` / `Space` | fold a connection open or shut |
+| `Space` on a database | hide it / show it again |
+| `r` | list every database on the host again |
 | `Enter` | select database · preview table (`SELECT TOP 100 *` or `LIMIT 100`) · open cell |
 | `h/l`, `w/b`, `0`/`$` | move between result columns |
 | `V` | select result rows; `y` copies them as JSON, `Y` as a markdown table |
@@ -66,46 +70,77 @@ editor then behaves like a plain textbox (and `Esc` jumps straight to the result
 ¹ `Ctrl+Enter` needs a terminal with the kitty keyboard protocol (e.g. WezTerm,
 kitty, newer Windows Terminal). `Ctrl+R` works everywhere.
 
-## Managing sources
+## Connections
 
-`a` in the database list opens a form for adding a **server** (one connection
-string, many databases — pick `all` or fetch the list and choose) or a standalone
-**database**. The form has an engine selector for `mssql`, `postgres` and `sqlite`;
-SQLite is a single file, so add it as a standalone database source. `e` edits the
-source behind the selected entry, `d` deletes it (with confirmation). Every save
-tests the connection first, then writes `config.json` atomically in quim's
-format — ids (`srv_`/`db_`), camelCase keys and unknown fields are preserved.
+The sidebar is the connection manager. `a` adds one, `e` edits, `d` deletes
+(with confirmation), `t` tests it. A connection is just a **name and a
+connection string** — the engine and whether the string points at one database
+or at a whole host are both read out of the string:
 
-Supported connection string formats:
+| Connection string | |
+| --- | --- |
+| `postgres://user:pass@host:5432/app` | Postgres, the database `app` |
+| `postgres://user:pass@host:5432/` | Postgres, every database on the host |
+| `Server=sql01,1433;User Id=sa;Password=…` | MSSQL, every database on the host |
+| `Server=sql01;Database=App;…` | MSSQL, the database `App` |
+| `/home/me/app.db`, `sqlite:///app.db`, `:memory:` | SQLite, one file |
+
+The form shows what it read under the connection string as you type. When a
+string is too exotic to place, the `Engine` row on that line switches from
+`auto` to a specific engine, and the choice is written to the config.
+
+A connection that points at a host unfolds in the sidebar into the databases it
+has; one that points at a single database is a single row. Folds and picks are
+remembered across restarts.
+
+### Which databases a host lists
+
+Three ways, from quickest to most thorough:
+
+- `Space` on a database hides it, and hides it back. It stays visible but
+  dimmed for the rest of the session so you can undo by eye.
+- `d` on a database does the same behind a y/n prompt — the same key deletes a
+  whole connection when the cursor is on the connection row, so the prompt says
+  which of the two it is about.
+- `e` on the connection opens the form, where the `Databases` row switches
+  between `auto`, `all` and `pick`. Choosing `pick` fetches the host's current
+  list and gives you a checkbox per database (`Space` ticks, `a` flips all).
+  This is the one that works after a restart, when the hidden databases are no
+  longer on screen to click.
+
+`r` on a connection is the reset: it re-lists the host and turns everything
+back on. It also widens a single-database connection into its whole host.
+
+Saving tests the connection first, then writes `config.json` atomically:
 
 ```json
 {
-  "servers": [
+  "connections": [
     {
-      "id": "srv_local",
+      "id": "conn_local",
       "name": "Local SQL Server",
-      "engine": "mssql",
       "connectionString": "Server=localhost,1433;User Id=sa;Password=...;TrustServerCertificate=True;Encrypt=False",
       "databases": "all"
     },
     {
-      "id": "srv_pg",
-      "name": "Local Postgres",
-      "engine": "postgres",
-      "connectionString": "postgres://user:pass@localhost:5432/postgres",
-      "databases": "all"
-    }
-  ],
-  "databases": [
+      "id": "conn_pg",
+      "name": "platform",
+      "connectionString": "postgres://user:pass@localhost:5432/app",
+      "databases": ["app"]
+    },
     {
-      "id": "db_sqlite",
+      "id": "conn_sqlite",
       "name": "Local SQLite",
-      "engine": "sqlite",
-      "connectionString": "/home/me/app.db"
+      "connectionString": "/home/me/app.db",
+      "databases": ["main"]
     }
   ]
 }
 ```
+
+`databases` is what the sidebar lists: `"all"` for everything the host reports,
+or the picked names. An `engine` key is only written when `auto` was
+overridden.
 
 quim's own settings live under the `quim` key in the same file:
 
@@ -113,13 +148,15 @@ quim's own settings live under the `quim` key in the same file:
 "quim": {
   "vimMode": true,
   "layout": { "sidebarWidth": 32, "dbListHeight": 12, "editorHeight": 9, "detailWidth": 50 },
-  "activeDb": "s:srv_977xnih:batman"
+  "collapsed": ["conn_977xnih"],
+  "activeDb": "conn_977xnih:batman"
 }
 ```
 
 Layout values are written when you resize panes (`Ctrl+W` + `hjkl`); omitted
 values fall back to the automatic layout. `activeDb` tracks the selected
-database so a restart drops you back where you were.
+database so a restart drops you back where you were; `collapsed` lists the
+connections that are folded shut.
 
 ## tmux & vim-tmux-navigator
 
@@ -139,8 +176,8 @@ reach quim — that's why `F2` ($EDITOR) exists as an alternative.
 
 ## Features
 
-- **Simple source model**: servers (with `databases: "all"` or a list)
-  and standalone databases, same id scheme, same name disambiguation.
+- **One kind of source**: a connection. Engine and scope are derived from the
+  connection string, and the sidebar is where they are managed.
 - **Schema-aware autocomplete**: tables, columns, schemas and keywords.
   Understands aliases — `FROM dbo.Ackumulator a` makes `a.` suggest the right columns.
 - **Modal editing**: a real vim subset in the query editor, toggleable in config.

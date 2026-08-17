@@ -5,9 +5,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{
-    App, FilterList, FormField, Pane, SettingsSection, SourceKind, StatusKind, GENERAL_ROWS,
-};
+use crate::app::{App, FilterList, FormField, FormScope, Pane, SideRow, StatusKind, GENERAL_ROWS};
 use crate::config;
 use crate::db::Category;
 use crate::editor::{CompKind, Mode};
@@ -206,12 +204,14 @@ fn scroll_window(
     *scroll..(*scroll + height).min(len)
 }
 
+/// The sidebar tree: connections, each with its databases underneath. While a
+/// filter is typed the tree flattens to just the matching databases.
 fn draw_db_list(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Pane::Databases;
-    let title = if app.pending_servers > 0 {
-        format!("Databases {}", spinner(app.tick))
+    let title = if app.pending_lists > 0 {
+        format!("Connections {}", spinner(app.tick))
     } else {
-        format!("Databases ({})", app.dbs.len())
+        format!("Connections ({})", app.cfg.connections.len())
     };
     let block = pane_block(&title, focused);
     let inner = block.inner(area);
@@ -223,51 +223,100 @@ fn draw_db_list(f: &mut Frame, app: &mut App, area: Rect) {
     }
     let header = lines.len();
     let height = (inner.height as usize).saturating_sub(header);
+    let width = inner.width as usize;
 
-    let filtered = app.filtered_dbs();
-    app.db_list.sel = app.db_list.sel.min(filtered.len().saturating_sub(1));
-    let range = scroll_window(
-        app.db_list.sel,
-        filtered.len(),
-        height,
-        &mut app.db_list.scroll,
-    );
+    let rows = app.visible_rows();
+    app.db_list.sel = app.db_list.sel.min(rows.len().saturating_sub(1));
+    let range = scroll_window(app.db_list.sel, rows.len(), height, &mut app.db_list.scroll);
+    let flat = !app.db_list.filter.is_empty();
 
     for pos in range {
-        let entry = &app.dbs[filtered[pos]];
         let is_sel = pos == app.db_list.sel;
-        let is_active = app.active.as_ref().map(|a| a.id.as_str()) == Some(entry.id.as_str());
-        // Cursor row is shown by colouring the text (same as the table list); the
-        // ● marker is what tells you which db is actually selected/connected.
-        let marker = if is_active { "● " } else { "  " };
-        let name_style = if is_sel && focused {
-            Style::new().fg(theme::ACCENT)
-        } else if is_active {
-            Style::new().fg(theme::ACCENT_DIM)
-        } else {
-            Style::new().fg(theme::TEXT)
+        let cursor = is_sel && focused;
+        let mut line = match rows[pos] {
+            SideRow::Conn(ci) => {
+                let c = &app.cfg.connections[ci];
+                let engine = c.engine();
+                let open = !app.cfg.quim.collapsed.contains(&c.id);
+                let known = config::supported_engine(&engine);
+                let meta = if known {
+                    let location = config::location_of(&engine, &c.connection_string);
+                    if location.is_empty() {
+                        engine.clone()
+                    } else {
+                        format!("{engine} · {location}")
+                    }
+                } else {
+                    "unknown engine".to_string()
+                };
+                let name_style = if cursor {
+                    Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
+                } else if known {
+                    Style::new().fg(theme::TEXT).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::new().fg(theme::ERROR)
+                };
+                // Name first, then as much of "engine · host" as still fits.
+                let name = fit(&c.name, width.saturating_sub(4));
+                let meta_w = width.saturating_sub(name.width() + 4);
+                Line::from(vec![
+                    Span::styled(
+                        if open { " ▾ " } else { " ▸ " },
+                        Style::new().fg(theme::FAINT),
+                    ),
+                    Span::styled(name, name_style),
+                    Span::styled(
+                        if meta_w >= 6 {
+                            format!("  {}", fit(&meta, meta_w.saturating_sub(2)))
+                        } else {
+                            String::new()
+                        },
+                        Style::new().fg(theme::FAINT),
+                    ),
+                ])
+            }
+            SideRow::Db(i) => {
+                let entry = &app.dbs[i];
+                let is_active =
+                    app.active.as_ref().map(|a| a.id.as_str()) == Some(entry.id.as_str());
+                // The ● marks the database queries actually run against; the
+                // cursor row is shown by colour, like the table list.
+                let marker = if is_active { "●" } else { " " };
+                let style = if cursor {
+                    Style::new().fg(theme::ACCENT)
+                } else if !entry.included {
+                    Style::new().fg(theme::FAINT)
+                } else if is_active {
+                    Style::new().fg(theme::ACCENT_DIM)
+                } else {
+                    Style::new().fg(theme::TEXT)
+                };
+                // Children sit one step in; a flat filter hit or a connection
+                // that is a single database stays at the left edge.
+                let indent = if flat || entry.name == entry.conn_name {
+                    format!(" {marker} ")
+                } else {
+                    format!(" {marker}   ")
+                };
+                let text = if flat { &entry.label } else { &entry.name };
+                Line::from(vec![
+                    Span::styled(indent.clone(), Style::new().fg(theme::ACCENT_DIM)),
+                    Span::styled(fit(text, width.saturating_sub(indent.width())), style),
+                ])
+            }
         };
-        let mut line = Line::from(vec![
-            Span::styled(marker, Style::new().fg(theme::ACCENT_DIM)),
-            Span::styled(
-                fit(&entry.label, inner.width.saturating_sub(3) as usize),
-                name_style,
-            ),
-        ]);
         if is_sel {
             line = line.style(Style::new().bg(theme::PANEL2));
         }
         lines.push(line);
     }
-    if app.dbs.is_empty() && app.pending_servers == 0 {
-        lines.push(Line::styled(
-            "  (no databases)",
-            Style::new().fg(theme::FAINT),
-        ));
-        lines.push(Line::styled(
-            "  , opens settings",
-            Style::new().fg(theme::FAINT),
-        ));
+    if rows.is_empty() {
+        let hint = if app.cfg.connections.is_empty() {
+            "  (no connections — a adds one)"
+        } else {
+            "  (no matches)"
+        };
+        lines.push(Line::styled(hint, Style::new().fg(theme::FAINT)));
     }
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -597,13 +646,13 @@ fn draw_results(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
     let Some(view) = &mut app.view else {
-        let hint = if app.dbs.is_empty() && app.pending_servers == 0 {
+        let hint = if app.dbs.is_empty() && app.pending_lists == 0 {
             vec![
                 Line::raw(""),
-                Line::styled("  No sources configured.", Style::new().fg(theme::MUTED)),
+                Line::styled("  No connections yet.", Style::new().fg(theme::MUTED)),
                 Line::raw(""),
                 Line::styled(
-                    "  Press , to open Settings and add a server or database,",
+                    "  Press a in the sidebar to add one,",
                     Style::new().fg(theme::FAINT),
                 ),
                 Line::styled(
@@ -885,16 +934,12 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         } else {
             format!(" {text}")
         };
-        if let Some(st) = &app.settings {
-            let hints = if !st.in_content {
-                "j/k section · l/Enter open · q close"
-            } else {
-                match st.section {
-                    SettingsSection::General => "j/k move · Space/Enter toggle · h back · q close",
-                    _ => "j/k move · a add · e edit · d delete · t test · h back · q close",
-                }
-            };
-            (left, color, format!("{hints} "))
+        if app.settings.is_some() {
+            (
+                left,
+                color,
+                "j/k move · Space/Enter toggle · q close ".to_string(),
+            )
         } else {
             let hints = match app.focus {
                 Pane::Editor if app.cfg.quim.vim_mode && app.editor.mode != Mode::Insert => {
@@ -909,7 +954,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
                 }
                 Pane::Results => "Enter detail · / search · V rows · y/Y yank · r rerun · ? help",
                 Pane::Detail => "j/k scroll · y copy · q close",
-                Pane::Databases => "Enter select · / filter · a/e/d sources · , settings",
+                Pane::Databases => "Enter select · a add · e edit · d hide/delete · t test · r all",
                 _ => "Enter select · / filter · ^R run · ? help",
             };
             (left, color, format!("{hints} · ^HJKL panes · ^W resize "))
@@ -929,20 +974,11 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
 // --- Settings screen ---------------------------------------------------------------
 
 fn draw_settings(f: &mut Frame, app: &mut App, area: Rect) {
-    // Clamp the selection first: sources may have been deleted since last draw.
-    let (section, in_content) = {
-        let st = app.settings.as_ref().unwrap();
-        (st.section, st.in_content)
+    let sel_row = {
+        let st = app.settings.as_mut().unwrap();
+        st.row = st.row.min(GENERAL_ROWS - 1);
+        st.row
     };
-    let len = match section {
-        SettingsSection::General => GENERAL_ROWS,
-        SettingsSection::Servers => app.cfg.servers.len(),
-        SettingsSection::Databases => app.cfg.databases.len(),
-    };
-    if let Some(st) = app.settings.as_mut() {
-        st.row = st.row.min(len.saturating_sub(1));
-    }
-    let sel_row = app.settings.as_ref().unwrap().row;
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -956,194 +992,52 @@ fn draw_settings(f: &mut Frame, app: &mut App, area: Rect) {
     if inner.width < 36 || inner.height < 5 {
         return;
     }
-    let [nav_a, sep_a, content_a] = Layout::horizontal([
-        Constraint::Length(17),
-        Constraint::Length(2),
-        Constraint::Min(20),
-    ])
-    .areas(inner);
 
-    // Section list on the left.
-    let sections = [
-        (SettingsSection::General, "General".to_string()),
-        (
-            SettingsSection::Servers,
-            format!("Servers ({})", app.cfg.servers.len()),
-        ),
-        (
-            SettingsSection::Databases,
-            format!("Databases ({})", app.cfg.databases.len()),
-        ),
-    ];
-    let mut nav: Vec<Line> = vec![Line::raw("")];
-    for (s, label) in &sections {
-        let current = *s == section;
-        let marker = if current { "▸ " } else { "  " };
-        let style = match (current, in_content) {
-            (true, false) => Style::new()
-                .fg(theme::ACCENT)
-                .bg(theme::PANEL2)
-                .add_modifier(Modifier::BOLD),
-            (true, true) => Style::new().fg(theme::ACCENT),
-            _ => Style::new().fg(theme::TEXT),
-        };
-        nav.push(Line::styled(
-            pad(&format!(" {marker}{label}"), nav_a.width as usize),
-            style,
-        ));
-    }
-    f.render_widget(Paragraph::new(nav), nav_a);
-
-    let sep: Vec<Line> = (0..sep_a.height)
-        .map(|_| Line::styled("│", Style::new().fg(theme::BORDER_SOFT)))
-        .collect();
-    f.render_widget(Paragraph::new(sep), sep_a);
-
-    // Content on the right.
-    let width = content_a.width as usize;
+    let width = inner.width as usize;
     let sel_style = Style::new()
         .fg(theme::TEXT)
         .bg(theme::PANEL2)
         .add_modifier(Modifier::BOLD);
-    let row_style = |i: usize| {
-        if in_content && i == sel_row {
+    let vim_on = app.cfg.quim.vim_mode;
+    let rows = [
+        (
+            format!(
+                "Vim mode            [{}] {}",
+                if vim_on { "x" } else { " " },
+                if vim_on { "on" } else { "off" }
+            ),
+            "modal editing in the query pane",
+        ),
+        (
+            "Reset pane layout".to_string(),
+            "clear the sizes saved with Ctrl+W",
+        ),
+    ];
+    let mut lines: Vec<Line> = vec![Line::raw("")];
+    for (i, (label, hint)) in rows.iter().enumerate() {
+        let style = if i == sel_row {
             sel_style
         } else {
             Style::new().fg(theme::TEXT)
-        }
-    };
-    let mut lines: Vec<Line> = vec![Line::raw("")];
-    match section {
-        SettingsSection::General => {
-            let vim_on = app.cfg.quim.vim_mode;
-            let rows = [
-                (
-                    format!(
-                        "Vim mode            [{}] {}",
-                        if vim_on { "x" } else { " " },
-                        if vim_on { "on" } else { "off" }
-                    ),
-                    "modal editing in the query pane",
-                ),
-                (
-                    "Reset pane layout".to_string(),
-                    "clear the sizes saved with Ctrl+W",
-                ),
-            ];
-            for (i, (label, hint)) in rows.iter().enumerate() {
-                lines.push(Line::from(vec![
-                    Span::styled(pad(&format!("  {label}"), 32.min(width)), row_style(i)),
-                    Span::styled(format!("  {hint}"), Style::new().fg(theme::FAINT)),
-                ]));
-            }
-            lines.push(Line::raw(""));
-            lines.push(Line::styled(
-                format!("  Saved to {}", crate::config::config_path().display()),
-                Style::new().fg(theme::FAINT),
-            ));
-        }
-        SettingsSection::Servers => {
-            let name_w = 20usize;
-            let host_w = width.saturating_sub(name_w + 6).clamp(10, 30);
-            lines.push(Line::styled(
-                format!(
-                    "  {}{}DATABASES",
-                    pad("NAME", name_w + 2),
-                    pad("ENGINE / HOST", host_w + 2)
-                ),
-                Style::new().fg(theme::MUTED).add_modifier(Modifier::BOLD),
-            ));
-            for (i, s) in app.cfg.servers.iter().enumerate() {
-                let host = source_location(&s.engine, &s.connection_string);
-                let summary = match &s.databases {
-                    crate::config::DbSelection::All(_) => "all".to_string(),
-                    crate::config::DbSelection::Named(v) => format!("{} selected", v.len()),
-                };
-                lines.push(Line::styled(
-                    format!(
-                        "  {}{}{summary}",
-                        pad(&fit(&s.name, name_w), name_w + 2),
-                        pad(&fit(&host, host_w), host_w + 2),
-                    ),
-                    row_style(i),
-                ));
-            }
-            if app.cfg.servers.is_empty() {
-                lines.push(Line::styled(
-                    "  (none — a adds one)",
-                    Style::new().fg(theme::FAINT),
-                ));
-            }
-        }
-        SettingsSection::Databases => {
-            let name_w = 20usize;
-            let host_w = width.saturating_sub(name_w + 6).clamp(10, 30);
-            lines.push(Line::styled(
-                format!(
-                    "  {}{}DATABASE",
-                    pad("NAME", name_w + 2),
-                    pad("ENGINE / HOST", host_w + 2)
-                ),
-                Style::new().fg(theme::MUTED).add_modifier(Modifier::BOLD),
-            ));
-            for (i, d) in app.cfg.databases.iter().enumerate() {
-                let host = source_location(&d.engine, &d.connection_string);
-                let db = crate::config::database_of_engine(&d.engine, &d.connection_string)
-                    .unwrap_or_default();
-                lines.push(Line::styled(
-                    format!(
-                        "  {}{}{db}",
-                        pad(&fit(&d.name, name_w), name_w + 2),
-                        pad(&fit(&host, host_w), host_w + 2),
-                    ),
-                    row_style(i),
-                ));
-            }
-            if app.cfg.databases.is_empty() {
-                lines.push(Line::styled(
-                    "  (none — a adds one)",
-                    Style::new().fg(theme::FAINT),
-                ));
-            }
-        }
+        };
+        lines.push(Line::from(vec![
+            Span::styled(pad(&format!("  {label}"), 32.min(width)), style),
+            Span::styled(format!("  {hint}"), Style::new().fg(theme::FAINT)),
+        ]));
     }
-    f.render_widget(Paragraph::new(lines), content_a);
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "  Connections live in the sidebar — a/e/d/t there.",
+        Style::new().fg(theme::FAINT),
+    ));
+    lines.push(Line::styled(
+        format!("  Saved to {}", crate::config::config_path().display()),
+        Style::new().fg(theme::FAINT),
+    ));
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
-// --- Source form -----------------------------------------------------------------
-
-fn source_location(engine: &str, connection_string: &str) -> String {
-    let engine = config::normalize_engine(engine);
-    let location = match engine.as_str() {
-        "mssql" => crate::config::server_of(connection_string).unwrap_or_default(),
-        "postgres" => postgres_host_of(connection_string).unwrap_or_default(),
-        "sqlite" => connection_string.trim().to_string(),
-        _ => String::new(),
-    };
-    if location.is_empty() {
-        engine
-    } else {
-        format!("{engine}: {location}")
-    }
-}
-
-fn postgres_host_of(connection_string: &str) -> Option<String> {
-    let raw = connection_string.trim();
-    if !(raw.starts_with("postgres://") || raw.starts_with("postgresql://")) {
-        return None;
-    }
-    let rest = raw.split_once("://").map(|(_, rest)| rest)?;
-    let authority = rest.split(['/', '?']).next().unwrap_or("");
-    let host_port = authority
-        .rsplit_once('@')
-        .map(|(_, host)| host)
-        .unwrap_or(authority);
-    if host_port.is_empty() {
-        None
-    } else {
-        Some(host_port.to_string())
-    }
-}
+// --- Connection form -----------------------------------------------------------
 
 fn centered(area: Rect, w: u16, h: u16) -> Rect {
     let w = w.min(area.width.saturating_sub(2));
@@ -1157,16 +1051,21 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 }
 
 fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
-    let Some((msg, _)) = &app.confirm else { return };
+    let Some((msg, action)) = &app.confirm else {
+        return;
+    };
+    // Hiding is reversible, deleting is not — don't dress them the same.
+    let (title, color) = if action.is_delete() {
+        (" Delete ", theme::ERROR)
+    } else {
+        (" Hide ", theme::ACCENT)
+    };
     let w = (msg.width() as u16 + 6).clamp(30, area.width.saturating_sub(4));
     let rect = centered(area, w, 3);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(theme::ERROR))
-        .title(Span::styled(
-            " Delete ",
-            Style::new().fg(theme::ERROR).bold(),
-        ));
+        .border_style(Style::new().fg(color))
+        .title(Span::styled(title, Style::new().fg(color).bold()));
     let inner = block.inner(rect);
     f.render_widget(Clear, rect);
     f.render_widget(block.style(Style::new().bg(theme::PANEL2)), rect);
@@ -1179,30 +1078,30 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// Add/edit a connection: a name, a connection string, and a line showing what
+/// quim read out of that string. The engine row is only a knob when the string
+/// is too exotic to read.
 fn draw_form(f: &mut Frame, app: &mut App, area: Rect) {
     let tick = app.tick;
     let Some(form) = &app.form else { return };
-    let server_form =
-        form.kind == SourceKind::Server && config::supports_server_sources(&form.engine);
-    let list_h = if server_form && !form.all_dbs && !form.db_list.is_empty() {
-        form.db_list.len().min(8) as u16
+    let scoped = form.fields().contains(&FormField::Scope);
+    let list_h = if scoped && form.scope == FormScope::Pick {
+        form.db_list.len().min(10) as u16
     } else {
         0
     };
-    let base: u16 = 2 // name + conn
-        + if form.editing_id.is_none() { 1 } else { 0 } // type
+    let height: u16 = 2 // name + conn
         + 1 // engine
-        + if server_form { 2 } else { 0 } // fetch + all
+        + u16::from(scoped)
         + list_h
         + if form.error.is_some() { 2 } else { 1 } // spacing + error
         + 1; // buttons
     let w = 76u16.min(area.width.saturating_sub(4));
-    let rect = centered(area, w, base + 2);
-    let title = match (form.editing_id.is_some(), form.kind) {
-        (false, SourceKind::Server) => " Add server ",
-        (false, SourceKind::Database) => " Add database ",
-        (true, SourceKind::Server) => " Edit server ",
-        (true, SourceKind::Database) => " Edit database ",
+    let rect = centered(area, w, height + 2);
+    let title = if form.editing_id.is_some() {
+        " Edit connection "
+    } else {
+        " Add connection "
     };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -1223,42 +1122,6 @@ fn draw_form(f: &mut Frame, app: &mut App, area: Rect) {
         .add_modifier(Modifier::BOLD);
     let label_style = Style::new().fg(theme::MUTED);
     let value_style = Style::new().fg(theme::TEXT);
-
-    if form.editing_id.is_none() {
-        let focused = form.focus == FormField::Kind;
-        let val = match form.kind {
-            SourceKind::Server => "‹ Server ›",
-            SourceKind::Database => "‹ Database ›",
-        };
-        lines.push(Line::from(vec![
-            Span::styled(pad(" Type", label_w), label_style),
-            Span::styled(
-                format!(" {val} "),
-                if focused { sel_style } else { value_style },
-            ),
-            Span::styled(
-                "  (server = one connection, many databases)",
-                Style::new().fg(theme::FAINT),
-            ),
-        ]));
-    }
-
-    let focused = form.focus == FormField::Engine;
-    let engine = config::normalize_engine(&form.engine);
-    let engine_hint = match engine.as_str() {
-        "mssql" => "ADO.NET: Server=...;Database=...",
-        "postgres" => "URL: postgres://user:pass@host:5432/db",
-        "sqlite" => "file path or sqlite: URL",
-        _ => "unsupported",
-    };
-    lines.push(Line::from(vec![
-        Span::styled(pad(" Engine", label_w), label_style),
-        Span::styled(
-            format!(" ‹ {} › ", engine),
-            if focused { sel_style } else { value_style },
-        ),
-        Span::styled(format!("  ({engine_hint})"), Style::new().fg(theme::FAINT)),
-    ]));
 
     for (field, label, text) in [
         (FormField::Name, " Name", &form.name),
@@ -1293,68 +1156,98 @@ fn draw_form(f: &mut Frame, app: &mut App, area: Rect) {
         ]));
     }
 
-    if server_form {
-        let focused = form.focus == FormField::Fetch;
-        let fetch_label = if form.fetching {
-            format!(" {} Fetching… ", spinner(tick))
-        } else {
-            " Fetch databases ".to_string()
-        };
-        lines.push(Line::from(vec![
-            Span::styled(pad("", label_w + 1), label_style),
-            Span::styled("[", Style::new().fg(theme::FAINT)),
-            Span::styled(
-                fetch_label,
-                if focused {
-                    sel_style
-                } else {
-                    Style::new().fg(theme::ACCENT_DIM)
+    // What the connection string turned out to be, live as it is typed.
+    let engine = form.engine();
+    let (summary, summary_style) = if form.conn.trim().is_empty() {
+        (
+            "postgres:// URL · Server=…;Database=… · path to a .db file".to_string(),
+            Style::new().fg(theme::FAINT),
+        )
+    } else if !config::supported_engine(&engine) {
+        (
+            "unrecognised — pick the engine here".to_string(),
+            Style::new().fg(theme::ERROR),
+        )
+    } else {
+        let location = config::location_of(&engine, &form.conn);
+        let database = config::database_of_engine(&engine, &form.conn);
+        let mut parts = vec![engine.clone()];
+        if !location.is_empty() {
+            parts.push(location);
+        }
+        parts.push(match &database {
+            Some(db) => db.clone(),
+            None => "all databases".into(),
+        });
+        (parts.join(" · "), Style::new().fg(theme::FAINT))
+    };
+    let focused = form.focus == FormField::Engine;
+    let shown_engine = form
+        .engine_override
+        .clone()
+        .unwrap_or_else(|| "auto".into());
+    lines.push(Line::from(vec![
+        Span::styled(pad(" Engine", label_w), label_style),
+        Span::styled(
+            format!(" ‹ {shown_engine} › "),
+            if focused { sel_style } else { value_style },
+        ),
+        Span::styled(format!("  {summary}"), summary_style),
+    ]));
+
+    // Which of the host's databases to list. Absent for engines that have only
+    // the one, where there is nothing to choose.
+    if form.fields().contains(&FormField::Scope) {
+        let focused = form.focus == FormField::Scope;
+        let (word, note) = match form.scope {
+            FormScope::Auto => (
+                "auto",
+                match config::database_of_engine(&engine, &form.conn) {
+                    Some(db) => format!("just {db}, as the connection string says"),
+                    None => "every database on the host".to_string(),
                 },
             ),
-            Span::styled("]", Style::new().fg(theme::FAINT)),
-        ]));
-
-        let focused = form.focus == FormField::AllToggle;
-        let mark = if form.all_dbs { "x" } else { " " };
+            FormScope::All => ("all", "every database on the host".to_string()),
+            FormScope::Pick if form.fetching => ("pick", format!("{} Listing…", spinner(tick))),
+            FormScope::Pick => (
+                "pick",
+                format!(
+                    "{} of {} ticked · Space toggles, a flips all",
+                    form.db_list.iter().filter(|(_, on)| *on).count(),
+                    form.db_list.len()
+                ),
+            ),
+        };
         lines.push(Line::from(vec![
             Span::styled(pad(" Databases", label_w), label_style),
             Span::styled(
-                format!(" [{mark}] all "),
+                format!(" ‹ {word} › "),
                 if focused { sel_style } else { value_style },
             ),
-            Span::styled(
-                if form.all_dbs {
-                    "(every database on the server)"
-                } else {
-                    "(pick from the list below)"
-                },
-                Style::new().fg(theme::FAINT),
-            ),
+            Span::styled(format!("  {note}"), Style::new().fg(theme::FAINT)),
         ]));
 
-        if !form.all_dbs && !form.db_list.is_empty() {
+        if form.scope == FormScope::Pick && !form.db_list.is_empty() {
             let focused = form.focus == FormField::DbList;
-            let visible = form.db_list.len().min(8);
+            let visible = form.db_list.len().min(10);
             let start = form
                 .list_sel
                 .saturating_sub(visible.saturating_sub(1))
                 .min(form.db_list.len() - visible);
             for (i, (name, on)) in form.db_list.iter().enumerate().skip(start).take(visible) {
                 let is_sel = focused && i == form.list_sel;
-                let mark = if *on { "x" } else { " " };
                 lines.push(Line::from(vec![
                     Span::styled(pad("", label_w + 1), label_style),
                     Span::styled(
-                        format!("[{mark}] {}", fit(name, field_w.saturating_sub(4))),
+                        format!(
+                            "[{}] {}",
+                            if *on { "x" } else { " " },
+                            fit(name, field_w.saturating_sub(4))
+                        ),
                         if is_sel { sel_style } else { value_style },
                     ),
                 ]));
             }
-        } else if !form.all_dbs && form.db_list.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled(pad("", label_w + 1), label_style),
-                Span::styled("(fetch databases first)", Style::new().fg(theme::FAINT)),
-            ]));
         }
     }
 
@@ -1386,21 +1279,24 @@ fn draw_form(f: &mut Frame, app: &mut App, area: Rect) {
                 Style::new().fg(theme::ACCENT)
             },
         ),
-        Span::styled("]   [", Style::new().fg(theme::FAINT)),
+        Span::styled("]  [", Style::new().fg(theme::FAINT)),
         Span::styled(
             " Cancel ",
             if cancel_focused {
                 sel_style
             } else {
-                value_style
+                Style::new().fg(theme::MUTED)
             },
         ),
         Span::styled("]", Style::new().fg(theme::FAINT)),
     ]));
 
     f.render_widget(Paragraph::new(lines), inner);
-    if let Some((cx, cy)) = cursor {
-        f.set_cursor_position(Position::new(inner.x + cx, inner.y + cy));
+    if let Some((x, y)) = cursor {
+        f.set_cursor_position(Position::new(
+            inner.x + x.min(inner.width.saturating_sub(1)),
+            inner.y + y,
+        ));
     }
 }
 
@@ -1417,12 +1313,18 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("Ctrl+W, then h/j/k/l", "resize pane (saved to config)"),
         ("", ""),
         ("j/k, gg/G, Ctrl+D/U", "navigate lists & results"),
-        ("/", "filter databases/tables · search results (n/p next/prev)"),
         (
-            ",",
-            "settings: vim mode, servers & databases (not in editor)",
+            "/",
+            "filter databases/tables · search results (n/p next/prev)",
         ),
-        ("a / e / d", "add / edit / delete source (database list)"),
+        (",", "settings: vim mode, pane layout (not in editor)"),
+        ("", ""),
+        ("a / e", "add / edit a connection (sidebar)"),
+        ("d", "on a database: hide it · on a connection: delete it"),
+        ("t", "test the connection under the cursor"),
+        ("h / l, Space", "fold a connection open or shut"),
+        ("Space (on a database)", "hide it / show it again"),
+        ("r", "list every database on the host again"),
         ("Enter", "select database / preview table / open cell"),
         ("h/l, w/b, 0/$", "move between result columns"),
         ("V", "select rows; y copies JSON, Y a markdown table"),
@@ -1437,7 +1339,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
             "",
             "w/b/e f/t gg/G 0/^/$ motions · p/P paste · :w runs the query",
         ),
-        ("", "toggle in , settings"),
+        ("", "toggle it in , settings"),
         ("Ctrl+E / F2", "open the query in $EDITOR"),
         (
             "Ctrl+N/P, Tab",
@@ -1659,15 +1561,10 @@ mod tests {
         }
     }
 
-    /// The rendered screen as one string per row.
-    fn render(view: QueryView) -> Vec<String> {
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut app = App::new(Config::default(), tx);
-        app.view = Some(view);
-        app.focus = Pane::Results;
-
+    /// The drawn screen as one string per row.
+    fn screen(app: &mut App) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
         terminal
             .backend()
             .buffer()
@@ -1675,6 +1572,53 @@ mod tests {
             .chunks(100)
             .map(|row| row.iter().map(|cell| cell.symbol()).collect())
             .collect()
+    }
+
+    fn render(view: QueryView) -> Vec<String> {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Config::default(), tx);
+        app.view = Some(view);
+        app.focus = Pane::Results;
+        screen(&mut app)
+    }
+
+    #[test]
+    fn the_sidebar_draws_connections_as_a_tree() {
+        let _cfg = config::use_scratch_config_dir();
+        let raw = r#"{"connections": [
+            {"id": "conn_sql", "name": "Local server",
+             "connectionString": "Server=sql01,1433;User Id=sa"},
+            {"id": "conn_lite", "name": "notes",
+             "connectionString": "/tmp/notes.db", "databases": ["main"]}
+        ]}"#;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(serde_json::from_str(raw).unwrap(), tx);
+        app.cfg.quim.layout.sidebar_width = Some(46); // room for the meta column
+        app.on_db_response(crate::db::DbResponse::Databases {
+            conn_id: "conn_sql".into(),
+            result: Ok(vec!["AppDb".into(), "master".into()]),
+        });
+
+        let text = screen(&mut app);
+        let side: Vec<&String> = text.iter().take(8).collect();
+        let line = |needle: &str| {
+            side.iter()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("no sidebar line with {needle:?} in {side:#?}"))
+        };
+        // The host says where it points and can be folded shut.
+        assert!(line("Local server").contains('▾'));
+        assert!(line("Local server").contains("mssql · sql01,1433"));
+        // Its databases sit under it, indented past the connection name.
+        // Counted in characters: the border and ▾ are multi-byte.
+        let indent = |needle: &str| {
+            let l = line(needle);
+            l[..l.find(needle).unwrap()].chars().count()
+        };
+        assert!(indent("AppDb") > indent("Local server"));
+        // A single-database connection is one row, no disclosure of its own.
+        assert!(!line("notes").contains('▾'));
+        assert_eq!(indent("notes"), indent("Local server"));
     }
 
     #[test]

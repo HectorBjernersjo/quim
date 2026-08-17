@@ -187,13 +187,9 @@ fn check() -> io::Result<()> {
         }
     };
     println!("config: {}", config::config_path().display());
-    println!(
-        "{} server(s), {} standalone database(s)",
-        cfg.servers.len(),
-        cfg.databases.len()
-    );
-    if cfg.servers.is_empty() && cfg.databases.is_empty() {
-        println!("No sources — add one in quim (press a).");
+    println!("{} connection(s)", cfg.connections.len());
+    if cfg.connections.is_empty() {
+        println!("No connections — add one in quim (press a).");
         return Ok(());
     }
 
@@ -209,7 +205,7 @@ fn check() -> io::Result<()> {
     };
 
     let mut app = App::new(cfg, req_tx.clone());
-    while app.pending_servers > 0 {
+    while app.pending_lists > 0 {
         let resp = recv("database listing");
         app.on_db_response(resp);
     }
@@ -222,13 +218,14 @@ fn check() -> io::Result<()> {
             .join(", ")
     );
 
-    let Some(first) = app.dbs.first().cloned() else {
+    // App::new already picked a database and asked for its schema — check the
+    // same one rather than guessing at the head of the list.
+    let Some(first) = app.active.clone().or_else(|| app.dbs.first().cloned()) else {
         println!("No databases to test against.");
         return Ok(());
     };
     print!("schema for {} … ", first.label);
     io::stdout().flush()?;
-    // App::new already requested the schema for the auto-selected first db.
     loop {
         match recv("schema") {
             db::DbResponse::Schema { result, .. } => {
